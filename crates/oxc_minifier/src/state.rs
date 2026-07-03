@@ -103,6 +103,17 @@ pub struct MinifierState<'a> {
     /// the incremental scoping refresh.
     pub(crate) dirty: PassDirty<'a>,
 
+    /// Candidate symbols proven unreachable by the whole-program liveness
+    /// analysis (`symbol_liveness`): declarations whose every reference sits
+    /// inside their own — or their reference cycle's — removable bodies, so
+    /// no live code can ever reach them (#13105). Computed by the driver
+    /// after the pre-loop flush; recomputed only when a flush reports that a
+    /// still-referenced candidate-kind symbol lost a reference. Consumed
+    /// alongside `symbol_is_unused` by the removal sites in
+    /// `remove_unused_declaration.rs`. Bits are `SymbolId::index()`; ids
+    /// minted after compute are beyond capacity and read as live.
+    pub(crate) dead_symbols: BitSet<'a>,
+
     /// Scratch buffer reused by `try_fold_concat` to build template literal
     /// quasis without allocating a fresh `String` per call.
     pub concat_scratch: String,
@@ -127,6 +138,7 @@ impl<'a> MinifierState<'a> {
             body_unsafe_stack: NonEmptyStack::new((scoping.root_scope_id(), false)),
             mutated: false,
             dirty: PassDirty::new(scoping.references_len(), allocator),
+            dead_symbols: BitSet::new_in(0, allocator),
             concat_scratch: String::new(),
         }
     }
@@ -141,6 +153,12 @@ impl<'a> MinifierState<'a> {
     /// seeding is skipped.
     pub fn seeds_symbol_facts(&self) -> bool {
         !self.dce || !self.options.treeshake.property_write_side_effects
+    }
+
+    /// Whether the liveness analysis proved this symbol unreachable. Ids
+    /// minted after the last compute are beyond capacity and read as live.
+    pub(crate) fn symbol_is_dead(&self, symbol_id: SymbolId) -> bool {
+        self.dead_symbols.contains(symbol_id.index())
     }
 
     /// Returns whether the AST was mutated since the last call, and resets.

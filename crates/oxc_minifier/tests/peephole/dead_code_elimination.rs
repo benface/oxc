@@ -711,3 +711,14 @@ fn dce_keeps_write_only_property_assignments() {
         "(function() {\n\tvar r = require(\"react\");\n\tvar o = function(e, t) {\n\t\treturn r.create(e, t);\n\t};\n\to.displayName = \"X\";\n})();",
     );
 }
+
+// #13105: dead recursive/cyclic declarations must also drop in dce-only mode
+// (rolldown's per-module treeshake preprocess).
+#[test]
+fn dce_recursive_unused_functions() {
+    test("function f() { f() }", "");
+    test("function c() { d() } function d() { c() }", "");
+    // Live references root the cycle.
+    test_same("function f() {\n\tf();\n}\nconsole.log(f);");
+    test_same("export function f() {\n\tf();\n}");
+}
