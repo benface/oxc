@@ -268,9 +268,8 @@ impl<F: Fields> Columns<F> {
         let iter =
             const { F::SHAPE.field_offsets() }.into_iter().zip(const { F::SHAPE.field_sizes() });
         for (field_offset, field_size) in iter {
-            // Cannot overflow: each column is within its allocation, whose size
-            // is `<= isize::MAX`, and
-            // `size * len <= size * capacity` for both allocations.
+            // Cannot overflow - each column is within its allocation, whose size is
+            // `<= isize::MAX`, and `size * len <= size * capacity` for both allocations
             let bytes = field_size * self.len;
 
             // SAFETY: By `self`'s invariants, `self.base_ptr` points to an allocation with
