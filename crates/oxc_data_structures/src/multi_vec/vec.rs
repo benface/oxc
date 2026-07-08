@@ -212,31 +212,27 @@ impl<I: Idx, F: Fields> MultiVec<I, F> {
     /// [`MAX_CAPACITY`]: Self::MAX_CAPACITY
     #[inline]
     pub fn push(&mut self, value: F) -> I {
+        // If full, grow.
+        // Growth is `#[cold] #[inline(never)]` as it's a rare event.
+        //
+        // Then fall through to the single shared write.
+        // Keep the write on this one path, do NOT complete the push inside a cold
+        // "grow, then write" continuation that takes `value`.
+        // Handing `value` to a separate function stages it to the stack on every
+        // iteration, and also stops the compiler holding `len` / `capacity` in registers -
+        // it reloads them from memory each iteration instead.
+        //
+        // With the current formulation, a bulk-push loop keeps `len` / `capacity`
+        // in registers (reloading only after a grow) and stores `value`'s fields
+        // straight from registers into the heap, instead of writing to stack,
+        // then copying to heap. `value` rides through the rare grow call
+        // in callee-saved registers, so it costs no hot-path spill.
         if self.columns.len == self.columns.capacity {
-            // Cold path as a separate function which completes the push itself,
-            // rather than growing and rejoining the hot path. A rejoin would
-            // require `self` and `value` to live across the `grow` call,
-            // costing register spills on the hot path.
-            return self.push_slow(value);
+            self.grow(1);
         }
 
-        // SAFETY: `len != capacity`, and `len <= capacity` by `MultiVec`'s invariants, so `len < capacity`
-        unsafe { self.push_unchecked(value) }
-    }
-
-    /// Grow, then push. Cold continuation of `push`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the new length would exceed [`MAX_CAPACITY`].
-    ///
-    /// [`MAX_CAPACITY`]: Self::MAX_CAPACITY
-    #[cold]
-    #[inline(never)]
-    fn push_slow(&mut self, value: F) -> I {
-        self.grow(1);
-
-        // SAFETY: `grow(1)` guarantees `capacity >= len + 1`, so `len < capacity`
+        // SAFETY: If was full, `grow(1)` above grew allocation.
+        // Either way, there's now space for `value` (`len < capacity`).
         unsafe { self.push_unchecked(value) }
     }
 
