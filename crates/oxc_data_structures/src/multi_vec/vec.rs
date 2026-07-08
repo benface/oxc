@@ -258,7 +258,7 @@ impl<I: Idx, F: Fields> MultiVec<I, F> {
         // SAFETY: Caller guarantees `len == capacity`
         unsafe { assert_unchecked!(self.columns.len == self.columns.capacity) };
 
-        assert!(self.columns.capacity < Self::MAX_CAPACITY, "maximum capacity exceeded");
+        assert!(self.columns.capacity < Self::MAX_CAPACITY, "Maximum capacity exceeded");
 
         let min_capacity = self.columns.capacity + 1;
         // SAFETY:
@@ -327,7 +327,7 @@ impl<I: Idx, F: Fields> MultiVec<I, F> {
     unsafe fn grow_for_reserve(&mut self, additional: usize) {
         // This check detects both `len + additional` exceeding `MAX_CAPACITY` and it overflowing `usize`.
         // The subtraction cannot underflow: `len <= MAX_CAPACITY` by `MultiVec`'s invariants.
-        assert!(additional <= Self::MAX_CAPACITY - self.columns.len, "maximum capacity exceeded");
+        assert!(additional <= Self::MAX_CAPACITY - self.columns.len, "Maximum capacity exceeded");
 
         // Cannot overflow: `additional <= MAX_CAPACITY - len` (checked above)
         let min_capacity = self.columns.len + additional;
@@ -435,7 +435,7 @@ impl<I: Idx, F: Fields> MultiVec<I, F> {
     #[inline(never)]
     fn out_of_bounds(&self, index: usize) -> ! {
         let len = self.columns.len;
-        panic!("index out of bounds: the len is {len} but the index is {index}");
+        panic!("Index out of bounds: `len` is {len} but `index` is {index}");
     }
 
     /// Get references to every field of the element at `index`, without checking

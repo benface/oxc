@@ -184,7 +184,7 @@ static PANIC_DROPS: AtomicUsize = AtomicUsize::new(0);
 
 impl Clone for PanicOnThirdClone {
     fn clone(&self) -> Self {
-        assert!(PANIC_CLONES.fetch_add(1, Ordering::Relaxed) != 2, "clone panicked");
+        assert!(PANIC_CLONES.fetch_add(1, Ordering::Relaxed) != 2, "Clone panicked");
         Self(self.0)
     }
 }
@@ -623,7 +623,7 @@ fn clone_is_independent() {
 }
 
 #[test]
-#[should_panic(expected = "index out of bounds: the len is 1 but the index is 1")]
+#[should_panic(expected = "Index out of bounds: `len` is 1 but `index` is 1")]
 fn get_out_of_bounds_panics() {
     let mut table = ScopeTable::new();
     table.push(scope(0));
@@ -631,7 +631,7 @@ fn get_out_of_bounds_panics() {
 }
 
 #[test]
-#[should_panic(expected = "index out of bounds")]
+#[should_panic(expected = "Index out of bounds")]
 fn field_accessor_out_of_bounds_panics() {
     let mut table = ScopeTable::new();
     table.push(scope(0));
@@ -652,7 +652,7 @@ fn push_up_to_index_type_max() {
 }
 
 #[test]
-#[should_panic(expected = "maximum capacity exceeded")]
+#[should_panic(expected = "Maximum capacity exceeded")]
 fn push_beyond_index_type_max_panics() {
     let mut table = SmallTable::new();
     for i in 0..5 {
@@ -661,7 +661,7 @@ fn push_beyond_index_type_max_panics() {
 }
 
 #[test]
-#[should_panic(expected = "maximum capacity exceeded")]
+#[should_panic(expected = "Maximum capacity exceeded")]
 fn reserve_beyond_index_type_max_panics() {
     let mut table = SmallTable::new();
     table.reserve(5);
