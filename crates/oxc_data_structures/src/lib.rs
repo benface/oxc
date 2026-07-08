@@ -15,6 +15,9 @@ pub mod fieldless_enum;
 #[cfg(feature = "inline_string")]
 pub mod inline_string;
 
+#[cfg(feature = "multi_vec")]
+pub mod multi_vec;
+
 #[cfg(feature = "non_null")]
 pub mod non_null;
 

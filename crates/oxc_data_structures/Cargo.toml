@@ -22,6 +22,9 @@ test = true
 doctest = true
 
 [dependencies]
+oxc_index = { workspace = true, optional = true }
+
+pastey = { workspace = true, optional = true }
 ropey = { workspace = true, optional = true }
 
 [features]
@@ -32,6 +35,7 @@ all = [
   "code_buffer",
   "fieldless_enum",
   "inline_string",
+  "multi_vec",
   "non_null",
   "rope",
   "slice_iter",
@@ -43,6 +47,7 @@ box_macros = []
 code_buffer = ["assert_unchecked"]
 fieldless_enum = []
 inline_string = ["assert_unchecked"]
+multi_vec = ["dep:oxc_index", "dep:pastey"]
 non_null = []
 rope = ["dep:ropey"]
 slice_iter = ["assert_unchecked"]
