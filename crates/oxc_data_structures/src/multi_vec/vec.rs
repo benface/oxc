@@ -21,6 +21,8 @@ use std::{
 
 use oxc_index::Idx;
 
+use crate::assert_unchecked;
+
 use super::{
     clone::SrcAndDstPtrs,
     columns::Columns,
@@ -228,12 +230,41 @@ impl<I: Idx, F: Fields> MultiVec<I, F> {
         // then copying to heap. `value` rides through the rare grow call
         // in callee-saved registers, so it costs no hot-path spill.
         if self.columns.len == self.columns.capacity {
-            self.grow(1);
+            // SAFETY: Just checked `len == capacity`
+            unsafe { self.grow_for_push() };
         }
 
-        // SAFETY: If was full, `grow(1)` above grew allocation.
+        // SAFETY: If was full, `grow_for_push` above grew the allocation.
         // Either way, there's now space for `value` (`len < capacity`).
         unsafe { self.push_unchecked(value) }
+    }
+
+    /// Grow the allocation to hold at least 1 more element when the current allocation is full.
+    ///
+    /// # SAFETY
+    ///
+    /// `self.columns.len` must be equal to `self.columns.capacity`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if capacity is already [`MAX_CAPACITY`].
+    ///
+    /// [`MAX_CAPACITY`]: Self::MAX_CAPACITY
+    #[cold]
+    #[inline(never)]
+    unsafe fn grow_for_push(&mut self) {
+        // Inform compiler that `len == capacity`.
+        // If `grow` is inlined, compiler can treat the 2 as equivalent, rather than reading both.
+        // SAFETY: Caller guarantees `len == capacity`
+        unsafe { assert_unchecked!(self.columns.len == self.columns.capacity) };
+
+        assert!(self.columns.capacity < Self::MAX_CAPACITY, "maximum capacity exceeded");
+
+        let min_capacity = self.columns.capacity + 1;
+        // SAFETY:
+        // `min_capacity > self.columns.capacity`.
+        // `capacity < MAX_CAPACITY` therefore `min_capacity <= MAX_CAPACITY`
+        unsafe { self.grow(min_capacity) };
     }
 
     /// Push a new element, without checking capacity.
@@ -269,16 +300,22 @@ impl<I: Idx, F: Fields> MultiVec<I, F> {
     /// [`MAX_CAPACITY`]: Self::MAX_CAPACITY
     #[inline]
     pub fn reserve(&mut self, additional: usize) {
-        // This is equivalent to `len + additional > capacity`, but is a single check, and
-        // cannot overflow: the subtraction cannot underflow (`len <= capacity` by `self`'s
-        // invariants), and if `len + additional` would overflow `usize`, then `additional`
-        // necessarily exceeds `capacity - len`, so the branch is taken.
+        // This is equivalent to `len + additional > capacity`, but is a single check,
+        // and cannot overflow. The subtraction cannot underflow (`len` is always `<= capacity`),
+        // and if `len + additional` would overflow `usize`, then `additional` necessarily
+        // exceeds `capacity - len`.
         if additional > self.columns.capacity - self.columns.len {
-            self.grow(additional);
+            // SAFETY: Just checked `additional > capacity - len`
+            unsafe { self.grow_for_reserve(additional) };
         }
     }
 
     /// Grow the allocation to hold at least `additional` more elements.
+    ///
+    /// # SAFETY
+    ///
+    /// `additional` must be `> self.columns.capacity - self.columns.len`.
+    /// i.e. there is insufficient capacity to hold `additional` more elements.
     ///
     /// # Panics
     ///
@@ -287,13 +324,28 @@ impl<I: Idx, F: Fields> MultiVec<I, F> {
     /// [`MAX_CAPACITY`]: Self::MAX_CAPACITY
     #[cold]
     #[inline(never)]
-    fn grow(&mut self, additional: usize) {
+    unsafe fn grow_for_reserve(&mut self, additional: usize) {
         // This check detects both `len + additional` exceeding `MAX_CAPACITY` and it overflowing `usize`.
         // The subtraction cannot underflow: `len <= MAX_CAPACITY` by `MultiVec`'s invariants.
         assert!(additional <= Self::MAX_CAPACITY - self.columns.len, "maximum capacity exceeded");
 
         // Cannot overflow: `additional <= MAX_CAPACITY - len` (checked above)
         let min_capacity = self.columns.len + additional;
+        // SAFETY:
+        // Caller guarantees `additional > capacity - len`, so `min_capacity > capacity`.
+        // Assertion above guarantees `min_capacity <= MAX_CAPACITY`.
+        unsafe { self.grow(min_capacity) };
+    }
+
+    /// Grow the allocation to hold at least `min_capacity` elements.
+    ///
+    /// # SAFETY
+    ///
+    /// * `min_capacity` must be `> self.columns.capacity`.
+    /// * `min_capacity` must be `<= MAX_CAPACITY`.
+    unsafe fn grow(&mut self, min_capacity: usize) {
+        debug_assert!(min_capacity > self.columns.capacity);
+        debug_assert!(min_capacity <= Self::MAX_CAPACITY);
 
         // Grow by doubling (clamped to `MAX_CAPACITY`), with a minimum capacity of 4.
         // The doubling cannot overflow: `capacity <= MAX_CAPACITY <= isize::MAX`,
@@ -302,7 +354,9 @@ impl<I: Idx, F: Fields> MultiVec<I, F> {
         // `MIN_CAPACITY` can be larger than `MAX_CAPACITY` if `ELEMENT_SIZE` is huge.
         let new_capacity =
             (self.columns.capacity * 2).max(min_capacity).max(MIN_CAPACITY).min(Self::MAX_CAPACITY);
+
         debug_assert!(new_capacity > self.columns.capacity);
+        debug_assert!(new_capacity <= Self::MAX_CAPACITY);
 
         // Allocation happens before any of `self`'s fields are mutated and before the old
         // allocation is deallocated, so `self`'s invariants hold even if `allocate` aborts.
