@@ -70,6 +70,10 @@ use super::{
 /// [`SHAPE`]: Fields::SHAPE
 /// [`drop_columns`]: Fields::drop_columns
 pub unsafe trait Fields: Sized {
+    // The four view types are bounded `Self: 'v`.
+    // Each borrows field data for `'v`, so `Self` must outlive `'v` -
+    // a view can't outlast the data it points to.
+
     /// References to each field of one element.
     type Ref<'v>
     where
