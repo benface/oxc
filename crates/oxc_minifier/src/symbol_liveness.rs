@@ -14,18 +14,20 @@
 //!
 //! ## Where the analysis runs
 //!
-//! One standalone walk ([`compute_dead_symbols`]) runs before the fixed-point
-//! loop so source-level dead cycles are visible to pass 1. After that the
-//! peephole traversal itself collects the analysis inputs as it goes (the
-//! `collect_*` hooks below write into [`LivenessCollect`]), and
-//! [`propagate_collected`] turns them into a fresh dead set at every flush —
-//! including after quiet passes, whose collection observes the previous
-//! pass's late mutations. The set consumed by a pass is therefore always
-//! exactly one pass stale, the same freshness the standalone recompute
-//! cadence had. That freshness is load-bearing: deferring consumption to the
-//! loop's fixed point was measured to LOSE output, because other passes
-//! rewrite late-exposed dead cycles into non-candidate shapes before a
-//! deferred recompute ever sees them.
+//! No standalone walk: traversals that already happen collect the analysis
+//! inputs as they go (the `collect_*` hooks below write into
+//! [`LivenessCollect`]). `Normalize`'s pre-loop traversal produces the
+//! initial set — unfiltered, since no previous candidate set exists yet to
+//! filter edges against — so source-level dead cycles are visible to pass 1.
+//! Each peephole pass then collects with the edge filter seeded by the
+//! previous pass, and [`propagate_collected`] turns the collection into a
+//! fresh dead set at every flush — including after quiet passes, whose
+//! collection observes the previous pass's late mutations. The set consumed
+//! by a pass is therefore always exactly one pass stale, the same freshness
+//! the standalone recompute cadence had. That freshness is load-bearing:
+//! deferring consumption to the loop's fixed point was measured to LOSE
+//! output, because other passes rewrite late-exposed dead cycles into
+//! non-candidate shapes before a deferred recompute ever sees them.
 //!
 //! Collection during a mutating pass can diverge from a settled-tree walk in
 //! exactly one dangerous direction: a reference MINTED behind the traversal
@@ -109,10 +111,12 @@
 //! leak only on capacity growth, which high-watermarks after early passes),
 //! keeping system allocations untouched.
 
+#[cfg(debug_assertions)]
 use std::cell::Cell;
 
 use oxc_allocator::{Allocator, BitSet, GetAllocator, Vec as ArenaVec};
 use oxc_ast::ast::*;
+#[cfg(debug_assertions)]
 use oxc_ast_visit::{
     Visit,
     walk::{
@@ -127,10 +131,9 @@ use oxc_ecmascript::{
     },
 };
 use oxc_semantic::{IsGlobalReference, Scoping};
-use oxc_syntax::{
-    scope::{ScopeFlags, ScopeId},
-    symbol::{SymbolFlags, SymbolId},
-};
+#[cfg(debug_assertions)]
+use oxc_syntax::scope::{ScopeFlags, ScopeId};
+use oxc_syntax::symbol::{SymbolFlags, SymbolId};
 
 use crate::{
     CompressOptions, CompressOptionsUnused, TraverseCtx,
@@ -236,13 +239,13 @@ fn analysis_enabled(scoping: &Scoping, options: &CompressOptions) -> bool {
 }
 
 /// Compute the dead set with a standalone walk of a settled tree. Returns
-/// `(dead, candidates)`; bits are `SymbolId::index()`. Ids minted after this
-/// runs are beyond capacity and read as live (`BitSet::contains` is `false`
-/// past capacity), matching the `PassDirty::dead_refs` convention.
+/// `(dead, candidates)`; bits are `SymbolId::index()`.
 ///
-/// Runs once before the fixed-point loop (the initial set for pass 1, and
-/// the seed for the in-pass collection's edge filter), and in debug builds
-/// as the ground truth the in-pass collection is validated against.
+/// Debug-only ground truth: the release pipeline never walks — collection
+/// rides the Normalize and peephole traversals — but every
+/// [`propagate_collected`] validates its dead set against this walk of the
+/// post-flush tree, so the whole test corpus checks the in-pass collection.
+#[cfg(debug_assertions)]
 pub fn compute_dead_symbols<'a>(
     program: &Program<'a>,
     scoping: &Scoping,
@@ -318,6 +321,7 @@ fn propagate(
     }
 }
 
+#[cfg(debug_assertions)]
 struct Collector<'a, 'b> {
     ctx: LivenessCtx<'b>,
     is_script: bool,
@@ -350,6 +354,7 @@ struct Collector<'a, 'b> {
     edges: ArenaVec<'a, (SymbolId, SymbolId)>,
 }
 
+#[cfg(debug_assertions)]
 impl Collector<'_, '_> {
     fn depth(&self) -> usize {
         self.scope_depth
@@ -388,6 +393,7 @@ impl Collector<'_, '_> {
     }
 }
 
+#[cfg(debug_assertions)]
 impl<'a> Visit<'a> for Collector<'_, '_> {
     fn enter_scope(&mut self, _flags: ScopeFlags, _scope_id: &Cell<Option<ScopeId>>) {
         self.scope_depth += 1;
@@ -519,6 +525,14 @@ pub struct LivenessCollect<'a> {
     /// [`analysis_enabled`]; stable for the whole pass, so every hook's
     /// enter/exit pair is balanced.
     active: bool,
+    /// Whether `prev_candidates` filters edge recording. `false` for the
+    /// Normalize seeding pass: no previous candidate set exists yet, and
+    /// filtering against an EMPTY set would route every deferred reference
+    /// to a root — everything live, no dead cycle visible to pass 1, a
+    /// regression of the core `function f() { f() }` case. The seeding pass
+    /// records all candidate-kind edges (paying the junk-edge cost once);
+    /// its propagation then seeds the filter for every loop pass.
+    filtered: bool,
     /// Candidates admitted this pass (per-site gates at enter time, on the
     /// pre-fold shape — folds only purify, so this under-approves relative
     /// to the settled tree: the sound direction, self-correcting next pass).
@@ -549,6 +563,7 @@ impl<'a> LivenessCollect<'a> {
     pub fn new(symbols_len: usize, allocator: &'a Allocator) -> Self {
         Self {
             active: false,
+            filtered: true,
             candidates: BitSet::new_in(symbols_len, allocator),
             live: BitSet::new_in(symbols_len, allocator),
             prev_candidates: BitSet::new_in(0, allocator),
@@ -560,13 +575,15 @@ impl<'a> LivenessCollect<'a> {
         }
     }
 
-    /// Seed the edge filter from the standalone pre-loop walk's candidates.
-    pub fn seed_prev_candidates(&mut self, candidates: BitSet<'a>) {
-        self.prev_candidates = candidates;
-    }
-
-    fn reset_for_pass(&mut self, active: bool, symbols_len: usize, allocator: &'a Allocator) {
+    fn reset_for_pass(
+        &mut self,
+        active: bool,
+        filtered: bool,
+        symbols_len: usize,
+        allocator: &'a Allocator,
+    ) {
         self.active = active;
+        self.filtered = filtered;
         self.current_candidate = None;
         self.frames.clear();
         if !active {
@@ -590,7 +607,8 @@ impl<'a> LivenessCollect<'a> {
             self.dead_next = BitSet::new_in(symbols_len, allocator);
         }
         // `prev_candidates` deliberately survives: it is the previous pass's
-        // output (or the pre-loop walk's), consumed as this pass's filter.
+        // output (or the Normalize seeding pass's), consumed as this pass's
+        // filter.
     }
 
     /// Mark a symbol live and enqueue it for propagation; deduplicated at
@@ -628,15 +646,30 @@ impl<'a> LivenessCollect<'a> {
     }
 }
 
-/// `Traverse::enter_program` body: reset the collection for this pass.
+/// `Traverse::enter_program` body for peephole passes: reset the collection,
+/// edge filter seeded by the previous pass's candidates.
 pub fn begin_pass(ctx: &mut TraverseCtx<'_>) {
+    begin(ctx, /* filtered */ true);
+}
+
+/// `Traverse::enter_program` body for the Normalize seeding pass: collect
+/// UNFILTERED — see [`LivenessCollect::filtered`]. Its propagation produces
+/// the initial dead set for pass 1 and seeds every later pass's edge filter.
+pub fn begin_seeding_pass(ctx: &mut TraverseCtx<'_>) {
+    begin(ctx, /* filtered */ false);
+}
+
+fn begin(ctx: &mut TraverseCtx<'_>, filtered: bool) {
     let allocator = ctx.allocator();
     let TraverseCtx { state, scoping, .. } = ctx;
     let enabled = analysis_enabled(scoping.scoping(), &state.options);
     let symbols_len = scoping.scoping().symbols_len();
-    state.liveness.reset_for_pass(enabled, symbols_len, allocator);
-    // Discard mint logs from outside the loop (Normalize's mints are settled
-    // tree by the time the pre-loop walk runs).
+    state.liveness.reset_for_pass(enabled, filtered, symbols_len, allocator);
+    // A pass observes mints made DURING it; anything already in the log
+    // predates this pass's traversal, which will visit those references as
+    // part of the tree. (`propagate_collected` drains the log at every
+    // flush, so this is a defensive reset — nothing mints between a flush
+    // and the next pass start.)
     scoping.clear_minted_symbols();
 }
 
@@ -661,7 +694,7 @@ pub fn collect_identifier_reference<'a>(
     match lv.current_candidate {
         None => lv.mark_live_root(symbol_id),
         Some(from) => {
-            if lv.prev_candidates.contains(symbol_id.index()) {
+            if !lv.filtered || lv.prev_candidates.contains(symbol_id.index()) {
                 lv.edges.push((from, symbol_id));
             } else {
                 lv.mark_live_root(symbol_id);

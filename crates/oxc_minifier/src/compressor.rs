@@ -1,9 +1,9 @@
-use oxc_allocator::{Allocator, GetAllocator};
+use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
 use oxc_semantic::{Scoping, SemanticBuilder};
 
 use crate::{
-    CompressOptions, ReusableTraverseCtx, TraverseCtx,
+    CompressOptions, ReusableTraverseCtx,
     peephole::{Normalize, NormalizeOptions, PeepholeOptimizations},
     state::MinifierState,
     symbol_liveness,
@@ -120,12 +120,13 @@ impl<'a> Compressor<'a> {
         // drop_console), so pass 1 already observes the pruned reference
         // counts and Normalize's drops cost no extra peephole pass.
         PeepholeOptimizations::flush_pass_dirty(program, ctx.get_mut());
-        // Initial liveness: reference cycles that are dead in the source
-        // (`function f() { f() }`) must be visible to pass 1. This is the
-        // only standalone walk — during the loop the peephole traversal
-        // itself collects the analysis inputs and every flush refreshes the
-        // set (see `symbol_liveness`).
-        Self::update_dead_symbols(program, ctx.get_mut());
+        // Initial liveness: Normalize's traversal doubled as the seeding
+        // collection pass (see `symbol_liveness::begin_seeding_pass`), so
+        // consuming it here makes source-level dead cycles
+        // (`function f() { f() }`) visible to pass 1 and seeds the edge
+        // filter — no standalone walk anywhere. The continue signal is
+        // irrelevant pre-loop: the loop below always runs at least once.
+        symbol_liveness::propagate_collected(program, ctx.get_mut());
         // Start the loop from a clean signal: Normalize's drops are flushed
         // above, so a Normalize-only mutation must not force a pointless
         // extra iteration.
@@ -168,20 +169,5 @@ impl<'a> Compressor<'a> {
             initial_references_len,
         );
         iteration
-    }
-
-    /// Compute the initial whole-program symbol-liveness set consumed by the
-    /// unused-declaration removal sites (#13105), and seed the in-pass
-    /// collection's edge filter with the walk's candidate set. Must run
-    /// against freshly-flushed scoping.
-    fn update_dead_symbols(program: &Program<'a>, ctx: &mut TraverseCtx<'a>) {
-        let (dead, candidates) = symbol_liveness::compute_dead_symbols(
-            program,
-            ctx.scoping(),
-            &ctx.state.options,
-            ctx.allocator(),
-        );
-        ctx.state.dead_symbols = dead;
-        ctx.state.liveness.seed_prev_candidates(candidates);
     }
 }

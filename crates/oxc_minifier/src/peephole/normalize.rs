@@ -11,7 +11,7 @@ use oxc_syntax::scope::ScopeFlags;
 use super::PeepholeOptimizations;
 use crate::{
     ReusableTraverseCtx, Traverse, TraverseCtx, minifier_traverse::traverse_mut_with_ctx,
-    symbol_facts::SymbolFact,
+    symbol_facts::SymbolFact, symbol_liveness,
 };
 
 #[derive(Default)]
@@ -52,10 +52,63 @@ impl<'a> Normalize {
 }
 
 impl<'a> Traverse<'a> for Normalize {
+    fn enter_program(&mut self, _node: &mut Program<'a>, ctx: &mut TraverseCtx<'a>) {
+        // Normalize's traversal doubles as the liveness SEEDING pass: it
+        // collects the initial analysis inputs (unfiltered — no previous
+        // candidate set exists yet), replacing a standalone pre-loop walk.
+        // See `symbol_liveness`.
+        symbol_liveness::begin_seeding_pass(ctx);
+    }
+
     fn exit_program(&mut self, node: &mut Program<'a>, _ctx: &mut TraverseCtx<'a>) {
         if self.options.remove_unnecessary_use_strict && node.source_type.is_module() {
             node.directives.drain_filter(|d| d.directive.as_str() == "use strict");
         }
+    }
+
+    // The `enter_identifier_reference` / `enter`/`exit_function` / `class` /
+    // `variable_declarator` hooks feed the liveness collection exactly like
+    // the peephole impl (see `symbol_liveness`); Normalize's mutations only
+    // diverge toward-live (drops were already visited; mints are logged at
+    // the choke point and force-rooted at flush).
+    fn enter_identifier_reference(
+        &mut self,
+        node: &mut IdentifierReference<'a>,
+        ctx: &mut TraverseCtx<'a>,
+    ) {
+        symbol_liveness::collect_identifier_reference(node, ctx);
+    }
+
+    fn enter_function(&mut self, node: &mut Function<'a>, ctx: &mut TraverseCtx<'a>) {
+        symbol_liveness::collect_enter_function(node, ctx);
+    }
+
+    fn exit_function(&mut self, _node: &mut Function<'a>, ctx: &mut TraverseCtx<'a>) {
+        symbol_liveness::collect_exit_region(ctx);
+    }
+
+    fn enter_class(&mut self, node: &mut Class<'a>, ctx: &mut TraverseCtx<'a>) {
+        symbol_liveness::collect_enter_class(node, ctx);
+    }
+
+    fn exit_class(&mut self, _node: &mut Class<'a>, ctx: &mut TraverseCtx<'a>) {
+        symbol_liveness::collect_exit_region(ctx);
+    }
+
+    fn enter_variable_declarator(
+        &mut self,
+        decl: &mut VariableDeclarator<'a>,
+        ctx: &mut TraverseCtx<'a>,
+    ) {
+        symbol_liveness::collect_enter_variable_declarator(decl, ctx);
+    }
+
+    fn exit_variable_declarator(
+        &mut self,
+        _decl: &mut VariableDeclarator<'a>,
+        ctx: &mut TraverseCtx<'a>,
+    ) {
+        symbol_liveness::collect_exit_region(ctx);
     }
 
     fn exit_statements(
