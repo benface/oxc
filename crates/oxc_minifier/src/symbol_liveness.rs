@@ -688,18 +688,33 @@ pub fn collect_identifier_reference<'a>(
     let scoping = scoping.scoping();
     let Some(reference_id) = ident.reference_id.get() else { return };
     let Some(symbol_id) = scoping.get_reference(reference_id).symbol_id() else { return };
+    if lv.filtered
+        && let Some(from) = lv.current_candidate
+    {
+        // Deferred-region references — most of the pass on bundle-shaped
+        // input — skip the `symbol_flags` load: the previous pass's
+        // candidate set subsumes the kind test (only candidate-kind
+        // declarations are ever admitted), so one cache-friendly bitset
+        // probe decides edge-vs-root, and rooting a filtered-out
+        // non-candidate-kind symbol is a deduplicated no-op (only
+        // candidates' live bits are consulted). The dead set is unchanged.
+        if lv.prev_candidates.contains(symbol_id.index()) {
+            lv.edges.push((from, symbol_id));
+        } else {
+            lv.mark_live_root(symbol_id);
+        }
+        return;
+    }
+    // Live-context references keep the kind test so the roots list stays
+    // candidate-kind only (junk roots would grow the arena worklist for
+    // symbols whose live bits nothing consults); the seeding pass keeps it
+    // because it is what bounds the unfiltered edge list.
     if !scoping.symbol_flags(symbol_id).intersects(CANDIDATE_KINDS) {
         return;
     }
     match lv.current_candidate {
         None => lv.mark_live_root(symbol_id),
-        Some(from) => {
-            if !lv.filtered || lv.prev_candidates.contains(symbol_id.index()) {
-                lv.edges.push((from, symbol_id));
-            } else {
-                lv.mark_live_root(symbol_id);
-            }
-        }
+        Some(from) => lv.edges.push((from, symbol_id)),
     }
 }
 
@@ -896,6 +911,16 @@ pub fn propagate_collected<'a>(
         lv.mark_live_root(symbol_id);
     }
     scoping.clear_minted_symbols();
+
+    // The seeding pass recorded edges unfiltered; candidacy is fully known
+    // now, so drop the (measured 77-84%) edges whose targets can never be
+    // dead before they hit the sort. A removed edge's only effect was a
+    // live mark on a non-candidate, which nothing consults. Loop passes
+    // filter at record time instead.
+    if !lv.filtered {
+        let LivenessCollect { edges, candidates, .. } = lv;
+        edges.retain(|&(_, target)| candidates.contains(target.index()));
+    }
 
     propagate(&lv.candidates, &mut lv.live, &mut lv.roots, &mut lv.edges);
 
