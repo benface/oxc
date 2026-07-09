@@ -15,12 +15,12 @@ use oxc_index::{Idx, IndexSlice};
 ///
 /// Same requirements as [`slice::from_raw_parts`]: `ptr` must be valid for reads of
 /// `len` consecutive initialized values of `T` (dangling but aligned is sufficient if
-/// `len == 0`), which must not be mutated for the duration of lifetime `'a`.
+/// `len == 0`), which must not be mutated for the duration of lifetime `'v`.
 #[inline]
-pub unsafe fn index_slice_from_raw_parts<'a, I: Idx, T>(
+pub unsafe fn index_slice_from_raw_parts<'v, I: Idx, T>(
     ptr: NonNull<u8>,
     len: usize,
-) -> &'a IndexSlice<I, [T]> {
+) -> &'v IndexSlice<I, [T]> {
     // SAFETY: Caller guarantees `slice::from_raw_parts`'s requirements.
     IndexSlice::from_slice(unsafe { slice::from_raw_parts(ptr.cast::<T>().as_ptr(), len) })
 }
@@ -32,12 +32,12 @@ pub unsafe fn index_slice_from_raw_parts<'a, I: Idx, T>(
 /// Same requirements as [`slice::from_raw_parts_mut`]: `ptr` must be valid for reads
 /// and writes of `len` consecutive initialized values of `T` (dangling but aligned is
 /// sufficient if `len == 0`), which must not be accessed through any other pointer for
-/// the duration of lifetime `'a`.
+/// the duration of lifetime `'v`.
 #[inline]
-pub unsafe fn index_slice_from_raw_parts_mut<'a, I: Idx, T>(
+pub unsafe fn index_slice_from_raw_parts_mut<'v, I: Idx, T>(
     ptr: NonNull<u8>,
     len: usize,
-) -> &'a mut IndexSlice<I, [T]> {
+) -> &'v mut IndexSlice<I, [T]> {
     // SAFETY: Caller guarantees `slice::from_raw_parts_mut`'s requirements.
     IndexSlice::from_slice_mut(unsafe { slice::from_raw_parts_mut(ptr.cast::<T>().as_ptr(), len) })
 }
