@@ -21,7 +21,7 @@ pub unsafe fn index_slice_from_raw_parts<'v, I: Idx, T>(
     ptr: NonNull<u8>,
     len: usize,
 ) -> &'v IndexSlice<I, [T]> {
-    // SAFETY: Caller guarantees `slice::from_raw_parts`'s requirements.
+    // SAFETY: Caller guarantees `slice::from_raw_parts`'s requirements
     IndexSlice::from_slice(unsafe { slice::from_raw_parts(ptr.cast::<T>().as_ptr(), len) })
 }
 
@@ -38,7 +38,7 @@ pub unsafe fn index_slice_from_raw_parts_mut<'v, I: Idx, T>(
     ptr: NonNull<u8>,
     len: usize,
 ) -> &'v mut IndexSlice<I, [T]> {
-    // SAFETY: Caller guarantees `slice::from_raw_parts_mut`'s requirements.
+    // SAFETY: Caller guarantees `slice::from_raw_parts_mut`'s requirements
     IndexSlice::from_slice_mut(unsafe { slice::from_raw_parts_mut(ptr.cast::<T>().as_ptr(), len) })
 }
 
@@ -55,6 +55,6 @@ pub unsafe fn index_slice_from_raw_parts_mut<'v, I: Idx, T>(
 #[inline]
 pub unsafe fn drop_column<T>(ptr: NonNull<u8>, len: usize) {
     // SAFETY: Caller guarantees `ptr` is aligned and valid for reads and writes of `len`
-    // initialized values of `T`, which are never used again.
+    // initialized values of `T`, which are never used again
     unsafe { ptr::drop_in_place(ptr::slice_from_raw_parts_mut(ptr.cast::<T>().as_ptr(), len)) }
 }
