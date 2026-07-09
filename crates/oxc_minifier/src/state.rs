@@ -107,11 +107,13 @@ pub struct MinifierState<'a> {
     /// analysis (`symbol_liveness`): declarations whose every reference sits
     /// inside their own — or their reference cycle's — removable bodies, so
     /// no live code can ever reach them (#13105). Computed by the driver
-    /// after the pre-loop flush; recomputed only when a flush reports that a
-    /// still-referenced candidate-kind symbol lost a reference. Consumed
-    /// alongside `symbol_is_unused` by the removal sites in
-    /// `remove_unused_declaration.rs`. Bits are `SymbolId::index()`; ids
-    /// minted after compute are beyond capacity and read as live.
+    /// after the pre-loop flush; recomputed when
+    /// `symbol_liveness::recompute_trigger` fires on a flush (a
+    /// still-referenced candidate-kind symbol lost a reference, or a direct
+    /// eval was dropped). Consumed alongside `symbol_is_unused` by the
+    /// removal sites in `remove_unused_declaration.rs`. Bits are
+    /// `SymbolId::index()`; ids minted after compute are beyond capacity and
+    /// read as live.
     pub(crate) dead_symbols: BitSet<'a>,
 
     /// Scratch buffer reused by `try_fold_concat` to build template literal

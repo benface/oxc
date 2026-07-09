@@ -30,7 +30,7 @@ use oxc_ast::ast::*;
 
 use crate::{
     ReusableTraverseCtx, Traverse, TraverseCtx, minifier_traverse::traverse_mut_with_ctx,
-    traverse_context::as_direct_eval_call,
+    symbol_liveness, traverse_context::as_direct_eval_call,
 };
 
 pub use self::normalize::{Normalize, NormalizeOptions};
@@ -419,7 +419,7 @@ impl<'a> PeepholeOptimizations {
                 .scoping_mut()
                 .retain_resolved_references_excluding(&ctx.state.dirty.dead_refs);
         }
-        let recompute_liveness = crate::symbol_liveness::recompute_trigger(
+        let recompute_liveness = symbol_liveness::recompute_trigger(
             ctx.scoping(),
             &ctx.state.options,
             &ctx.state.dirty.dead_refs,

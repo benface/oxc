@@ -149,13 +149,10 @@ impl<'a> PeepholeOptimizations {
             // `classify_class_removability`), so a dead-CYCLE class must
             // extract nothing — extracted expressions would promote
             // references to removed cycle members into live code.
-            #[cfg(debug_assertions)]
-            if ctx.state.symbol_is_dead(symbol_id) {
-                debug_assert!(
-                    exprs.is_empty(),
-                    "dead-cycle class removal must not extract expressions"
-                );
-            }
+            debug_assert!(
+                !ctx.state.symbol_is_dead(symbol_id) || exprs.is_empty(),
+                "dead-cycle class removal must not extract expressions"
+            );
             if exprs.is_empty() {
                 Statement::new_empty_statement(c.span, ctx)
             } else {
