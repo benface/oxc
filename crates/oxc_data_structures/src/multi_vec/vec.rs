@@ -181,7 +181,12 @@ impl<I: Idx, F: Fields> MultiVec<I, F> {
     /// Returns the number of elements.
     #[inline]
     pub fn len(&self) -> usize {
-        self.columns.len
+        let len = self.columns.len;
+        // Communicate the bound on the returned value to compiler
+        // (e.g. so `a.len() + b.len()` is provably overflow-free).
+        // SAFETY: `len <= capacity <= MAX_CAPACITY` by `MultiVec`'s invariants.
+        unsafe { assert_unchecked!(len <= Self::MAX_CAPACITY) };
+        len
     }
 
     /// Returns `true` if there are no elements.
@@ -193,7 +198,11 @@ impl<I: Idx, F: Fields> MultiVec<I, F> {
     /// Returns the number of elements the `MultiVec` can hold without reallocating.
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.columns.capacity
+        let capacity = self.columns.capacity;
+        // Communicate the bound on the returned value to compiler.
+        // SAFETY: `capacity <= MAX_CAPACITY` by `MultiVec`'s invariants.
+        unsafe { assert_unchecked!(capacity <= Self::MAX_CAPACITY) };
+        capacity
     }
 
     /// Get a clone of the [`Columns`].
@@ -475,19 +484,31 @@ impl<I: Idx, F: Fields> MultiVec<I, F> {
     /// Get slices over every column.
     #[inline]
     pub fn slices(&self) -> F::Slices<'_> {
+        let len = self.columns.len;
+
+        // Communicate the bound on the slices' length to compiler.
+        // SAFETY: `len <= capacity <= MAX_CAPACITY` by `MultiVec`'s invariants.
+        unsafe { assert_unchecked!(len <= Self::MAX_CAPACITY) };
+
         // SAFETY: `slice_ptrs` returns aligned pointers to the columns' starts
         // (dangling if `capacity == 0`, but `len == 0` then too), whose first `len` elements
         // are initialized (by `self`'s invariants).
         // The slices borrow `self`, so the values cannot be mutated while they live.
-        unsafe { F::slices(self.columns.slice_ptrs(), self.columns.len) }
+        unsafe { F::slices(self.columns.slice_ptrs(), len) }
     }
 
     /// Get mutable slices over every column.
     #[inline]
     pub fn slices_mut(&mut self) -> F::SlicesMut<'_> {
+        let len = self.columns.len;
+
+        // Communicate the bound on the slices' length to compiler.
+        // SAFETY: `len <= capacity <= MAX_CAPACITY` by `MultiVec`'s invariants.
+        unsafe { assert_unchecked!(len <= Self::MAX_CAPACITY) };
+
         // SAFETY: Same as `slices`, plus the slices borrow `self` exclusively,
         // so the values cannot be otherwise accessed while they live
-        unsafe { F::slices_mut(self.columns.slice_ptrs(), self.columns.len) }
+        unsafe { F::slices_mut(self.columns.slice_ptrs(), len) }
     }
 
     /// Iterate over all valid indices.
@@ -498,8 +519,21 @@ impl<I: Idx, F: Fields> MultiVec<I, F> {
     /// IDs of elements pushed after the `iter_ids` call are not included.
     #[inline]
     pub fn iter_ids(&self) -> impl ExactSizeIterator<Item = I> + FusedIterator + use<I, F> {
-        // SAFETY: `i < len <= MAX_CAPACITY <= I::MAX + 1`, so `i <= I::MAX`
-        (0..self.columns.len).map(|i| unsafe { I::from_usize_unchecked(i) })
+        let len = self.columns.len;
+
+        // Communicate the bound on the returned iterator's length (`size_hint`) to compiler.
+        // SAFETY: `len <= capacity <= MAX_CAPACITY` by `MultiVec`'s invariants.
+        unsafe { assert_unchecked!(len <= Self::MAX_CAPACITY) };
+
+        (0..len).map(|i| {
+            // Communicate the bound on the yielded index to compiler.
+            // SAFETY: `len <= capacity <= MAX_CAPACITY` by `MultiVec`'s invariants.
+            // `len <= Self::MAX_CAPACITY`, and max value of `i` is `len - 1`.
+            unsafe { assert_unchecked!(i < Self::MAX_CAPACITY) };
+
+            // SAFETY: `i < len <= MAX_CAPACITY <= I::MAX + 1`, so `i <= I::MAX`
+            unsafe { I::from_usize_unchecked(i) }
+        })
     }
 
     /// Iterate over the elements, yielding references to every field of each element.
