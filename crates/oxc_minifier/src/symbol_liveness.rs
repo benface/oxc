@@ -12,6 +12,31 @@
 //! mark their targets live once the candidate itself is marked live. Dead
 //! cycles are simply never reached — no cycle detection is needed.
 //!
+//! ## Where the analysis runs
+//!
+//! One standalone walk ([`compute_dead_symbols`]) runs before the fixed-point
+//! loop so source-level dead cycles are visible to pass 1. After that the
+//! peephole traversal itself collects the analysis inputs as it goes (the
+//! `collect_*` hooks below write into [`LivenessCollect`]), and
+//! [`propagate_collected`] turns them into a fresh dead set at every flush —
+//! including after quiet passes, whose collection observes the previous
+//! pass's late mutations. The set consumed by a pass is therefore always
+//! exactly one pass stale, the same freshness the standalone recompute
+//! cadence had. That freshness is load-bearing: deferring consumption to the
+//! loop's fixed point was measured to LOSE output, because other passes
+//! rewrite late-exposed dead cycles into non-candidate shapes before a
+//! deferred recompute ever sees them.
+//!
+//! Collection during a mutating pass can diverge from a settled-tree walk in
+//! exactly one dangerous direction: a reference MINTED behind the traversal
+//! cursor is never visited, so its target could be marked dead while a live
+//! reference to it exists. Every bound-reference mint funnels through
+//! `TraverseScoping::create_bound_reference`, which logs the symbol; the log
+//! is force-rooted at flush. All other divergences are toward-live and
+//! self-correct one pass later (a debug validator in [`propagate_collected`]
+//! checks the dead set against a ground-truth walk across the whole test
+//! corpus).
+//!
 //! ## The gate-mirror invariant (correctness, not style)
 //!
 //! Candidacy here must be a SUBSET of what the removal sites in
@@ -27,7 +52,8 @@
 //! - script-mode: statements whose removal site runs at the root scope are
 //!   position-ineligible (mirrors `keep_top_level_var_in_script_mode`, which
 //!   compares the *visitation* scope of the removal site — for a for-init
-//!   declarator that is one scope above the declarator itself).
+//!   declarator that is the scope containing the `for` statement, one above
+//!   the declarator's own visitation scope).
 //! - declarator inits must be dropped whole by `remove_unused_expression`:
 //!   kinds with specialized handlers there can leave residue, so candidacy
 //!   excludes them via the shared
@@ -67,7 +93,9 @@
 //! Side-effect judgments here use a context with strictly less information
 //! than the peephole `TraverseCtx` (no tracked constant values). Extra
 //! information only ever proves MORE expressions pure, so "pure here" implies
-//! "pure at the removal site" — the direction the invariant needs.
+//! "pure at the removal site" — the direction the invariant needs. The
+//! in-pass collection uses the same lean context so its candidacy agrees
+//! with the ground-truth walk.
 //!
 //! ## Allocation discipline
 //!
@@ -76,11 +104,14 @@
 //! candidate-kind `SymbolFlags` (most references cost one flag check and no
 //! storage), roots are deduplicated at record time by marking them live
 //! immediately, and the edge "graph" is a flat list sorted by source symbol,
-//! range-scanned via `partition_point` — no per-candidate allocations.
+//! range-scanned via `partition_point` — no per-candidate allocations. The
+//! in-pass collection buffers are `clear()`-reused across passes (arena vecs
+//! leak only on capacity growth, which high-watermarks after early passes),
+//! keeping system allocations untouched.
 
 use std::cell::Cell;
 
-use oxc_allocator::{Allocator, BitSet, Vec as ArenaVec};
+use oxc_allocator::{Allocator, BitSet, GetAllocator, Vec as ArenaVec};
 use oxc_ast::ast::*;
 use oxc_ast_visit::{
     Visit,
@@ -97,13 +128,13 @@ use oxc_ecmascript::{
 };
 use oxc_semantic::{IsGlobalReference, Scoping};
 use oxc_syntax::{
-    reference::ReferenceId,
     scope::{ScopeFlags, ScopeId},
     symbol::{SymbolFlags, SymbolId},
 };
 
 use crate::{
-    CompressOptions, CompressOptionsUnused,
+    CompressOptions, CompressOptionsUnused, TraverseCtx,
+    generated::ancestor::Ancestor,
     peephole::{ClassRemovability, PeepholeOptimizations},
 };
 
@@ -114,47 +145,6 @@ const CANDIDATE_KINDS: SymbolFlags = SymbolFlags::FunctionScopedVariable
     .union(SymbolFlags::BlockScopedVariable)
     .union(SymbolFlags::Class)
     .union(SymbolFlags::Function);
-
-/// Whether the driver must recompute [`compute_dead_symbols`] after a flush:
-/// a reference to a candidate-kind symbol was pruned while the symbol still
-/// has remaining references — the reference-loss transition that turns a
-/// live reference cycle dead. A dropped direct eval also triggers (the flag
-/// refresh may clear the root flag that forces [`compute_dead_symbols`] to
-/// skip). Candidacy-SHAPE transitions are deliberately NOT caught: a fold
-/// can turn a specialized-kind init into a fully-removable one (e.g.
-/// `(0, () => b())` into `() => b()`) without pruning any reference, so the
-/// newly-dead cycle survives this run — stale toward LIVE, hence sound; the
-/// cycle drops on a second minify run (a known non-idempotency, traded for
-/// not re-walking on every shape-changing fold). On large inputs most
-/// passes prune candidate-kind references, so this fires often; its job is
-/// to skip the walk for quiet/late iterations, not to make recomputes rare.
-///
-/// Must be called AFTER `retain_resolved_references_excluding`: the prune
-/// only shrinks per-symbol resolved-reference lists, `Reference` entries
-/// survive, so the pruned references can still be inspected here.
-pub fn recompute_trigger(
-    scoping: &Scoping,
-    options: &CompressOptions,
-    dead_refs: &BitSet<'_>,
-    eval_dropped: bool,
-) -> bool {
-    if options.unused == CompressOptionsUnused::Keep {
-        return false;
-    }
-    if eval_dropped {
-        return true;
-    }
-    if scoping.root_scope_flags().contains_direct_eval() {
-        // `compute_dead_symbols` would skip anyway.
-        return false;
-    }
-    dead_refs.ones().any(|idx| {
-        scoping.get_reference(ReferenceId::from_usize(idx)).symbol_id().is_some_and(|symbol_id| {
-            scoping.symbol_flags(symbol_id).intersects(CANDIDATE_KINDS)
-                && !scoping.symbol_is_unused(symbol_id)
-        })
-    })
-}
 
 /// Side-effect context for use outside the peephole traversal. Mirrors the
 /// `TraverseCtx` impls in `traverse_context/ecma_context.rs`, minus the
@@ -193,24 +183,74 @@ impl MayHaveSideEffectsContext<'_> for LivenessCtx<'_> {
     }
 }
 
-/// Compute the set of candidate symbols no live code can reach. Bits are
-/// `SymbolId::index()`; ids minted after this runs are beyond capacity and
-/// read as live (`BitSet::contains` is `false` past capacity), matching the
-/// `PassDirty::dead_refs` convention.
+/// In script mode a binding that lives in the ROOT scope is observable
+/// by other scripts (global object property / global lexical binding)
+/// no matter where its declaration statement sits: a block `var` hoists
+/// its BINDING to the root while its statement stays at removable block
+/// depth.
+fn symbol_is_script_global(scoping: &Scoping, is_script: bool, symbol_id: SymbolId) -> bool {
+    is_script && scoping.symbol_scope_id(symbol_id) == scoping.root_scope_id()
+}
+
+/// Annex B.3.3: in sloppy code, a plain block-level function declaration
+/// also creates a runtime var-alias binding in the enclosing var scope.
+/// The binder models that alias by MOVING the first same-named
+/// function's binding into the var scope (accurate — references resolve
+/// to it); a plain function whose binding still sits in a sloppy non-var
+/// scope is a later duplicate (or a blocked hoist), whose runtime
+/// re-assignment of the alias is invisible to reference resolution — no
+/// such declaration is a safe candidate. Applies to sloppy non-script
+/// code too (`.cjs`), so this checks strictness, not `is_script`.
+fn is_unmodeled_annex_b_alias(scoping: &Scoping, func: &Function<'_>, symbol_id: SymbolId) -> bool {
+    // Annex B.3.3 covers plain functions only; async/generator block
+    // functions are purely lexical and accurately modeled.
+    if func.r#async || func.generator {
+        return false;
+    }
+    let flags = scoping.scope_flags(scoping.symbol_scope_id(symbol_id));
+    !flags.is_var() && !flags.is_strict_mode()
+}
+
+/// Init shapes `remove_unused_expression` fully drops when pure. Kinds
+/// with specialized handlers can leave residue (a surviving expression
+/// whose references would dangle once the cycle is removed), so they are
+/// not candidates.
+fn init_fully_removable(init: Option<&Expression<'_>>, ctx: &LivenessCtx<'_>) -> bool {
+    match init {
+        None | Some(Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)) => {
+            true
+        }
+        Some(e) => {
+            !PeepholeOptimizations::expr_has_specialized_unused_handler(e)
+                && !e.may_have_side_effects(ctx)
+        }
+    }
+}
+
+/// Whether the analysis is enabled for this program state: mirrors
+/// `can_remove_unused_declarators` (any direct eval flags the root via
+/// ancestor propagation — see `refresh_direct_eval_flags`).
+fn analysis_enabled(scoping: &Scoping, options: &CompressOptions) -> bool {
+    options.unused != CompressOptionsUnused::Keep
+        && !scoping.root_scope_flags().contains_direct_eval()
+}
+
+/// Compute the dead set with a standalone walk of a settled tree. Returns
+/// `(dead, candidates)`; bits are `SymbolId::index()`. Ids minted after this
+/// runs are beyond capacity and read as live (`BitSet::contains` is `false`
+/// past capacity), matching the `PassDirty::dead_refs` convention.
+///
+/// Runs once before the fixed-point loop (the initial set for pass 1, and
+/// the seed for the in-pass collection's edge filter), and in debug builds
+/// as the ground truth the in-pass collection is validated against.
 pub fn compute_dead_symbols<'a>(
     program: &Program<'a>,
     scoping: &Scoping,
     options: &CompressOptions,
     allocator: &'a Allocator,
-) -> BitSet<'a> {
-    let empty = || BitSet::new_in(0, allocator);
-    if options.unused == CompressOptionsUnused::Keep {
-        return empty();
-    }
-    // Mirrors `can_remove_unused_declarators` and subsumes the per-site
-    // current-scope checks: any direct eval flags the root via ancestor
-    // propagation (see `refresh_direct_eval_flags`).
-    if scoping.root_scope_flags().contains_direct_eval() {
+) -> (BitSet<'a>, BitSet<'a>) {
+    let empty = || (BitSet::new_in(0, allocator), BitSet::new_in(0, allocator));
+    if !analysis_enabled(scoping, options) {
         return empty();
     }
 
@@ -235,27 +275,8 @@ pub fn compute_dead_symbols<'a>(
         return empty();
     }
 
-    // The flat edge list sorted by source symbol is the adjacency "map":
-    // a live symbol's targets are one `partition_point` range scan away.
-    edges.sort_unstable_by_key(|&(from, _)| from.index());
-
-    // Roots are already marked live (record-time dedup); propagate.
-    // Marking non-candidate targets live is harmless — only candidates are
-    // consulted below.
     let mut worklist = roots;
-    while let Some(symbol_id) = worklist.pop() {
-        // Only candidates have outgoing edges by construction.
-        if !candidates.contains(symbol_id.index()) {
-            continue;
-        }
-        let start = edges.partition_point(|&(from, _)| from.index() < symbol_id.index());
-        for &(_, target) in edges[start..].iter().take_while(|&&(from, _)| from == symbol_id) {
-            if !live.contains(target.index()) {
-                live.set_bit(target.index());
-                worklist.push(target);
-            }
-        }
-    }
+    propagate(&candidates, &mut live, &mut worklist, &mut edges);
 
     let mut dead = BitSet::new_in(symbols_len, allocator);
     for candidate in candidates.ones() {
@@ -263,7 +284,38 @@ pub fn compute_dead_symbols<'a>(
             dead.set_bit(candidate);
         }
     }
-    dead
+    (dead, candidates)
+}
+
+/// Worklist propagation shared by the standalone walk and the in-pass
+/// collection. The flat edge list sorted by source symbol is the adjacency
+/// "map": a live symbol's targets are one `partition_point` range scan away.
+/// Roots are already marked live (record-time dedup); marking non-candidate
+/// targets live is harmless — only candidates are consulted for deadness.
+fn propagate(
+    candidates: &BitSet<'_>,
+    live: &mut BitSet<'_>,
+    worklist: &mut ArenaVec<'_, SymbolId>,
+    edges: &mut ArenaVec<'_, (SymbolId, SymbolId)>,
+) {
+    edges.sort_unstable_by_key(|&(from, _)| from.index());
+    while let Some(symbol_id) = worklist.pop() {
+        // Only candidates have outgoing edges by construction.
+        if !candidates.contains(symbol_id.index()) {
+            continue;
+        }
+        let start = edges.partition_point(|&(from, _)| from.index() < symbol_id.index());
+        for i in start..edges.len() {
+            let (from, target) = edges[i];
+            if from != symbol_id {
+                break;
+            }
+            if !live.contains(target.index()) {
+                live.set_bit(target.index());
+                worklist.push(target);
+            }
+        }
+    }
 }
 
 struct Collector<'a, 'b> {
@@ -310,35 +362,6 @@ impl Collector<'_, '_> {
         !(self.is_script && depth <= 1)
     }
 
-    /// In script mode a binding that lives in the ROOT scope is observable
-    /// by other scripts (global object property / global lexical binding)
-    /// no matter where its declaration statement sits: a block `var` hoists
-    /// its BINDING to the root while its statement stays at removable block
-    /// depth.
-    fn symbol_is_script_global(&self, symbol_id: SymbolId) -> bool {
-        self.is_script
-            && self.ctx.scoping.symbol_scope_id(symbol_id) == self.ctx.scoping.root_scope_id()
-    }
-
-    /// Annex B.3.3: in sloppy code, a plain block-level function declaration
-    /// also creates a runtime var-alias binding in the enclosing var scope.
-    /// The binder models that alias by MOVING the first same-named
-    /// function's binding into the var scope (accurate — references resolve
-    /// to it); a plain function whose binding still sits in a sloppy non-var
-    /// scope is a later duplicate (or a blocked hoist), whose runtime
-    /// re-assignment of the alias is invisible to reference resolution — no
-    /// such declaration is a safe candidate. Applies to sloppy non-script
-    /// code too (`.cjs`), so this checks strictness, not `is_script`.
-    fn is_unmodeled_annex_b_alias(&self, func: &Function<'_>, symbol_id: SymbolId) -> bool {
-        // Annex B.3.3 covers plain functions only; async/generator block
-        // functions are purely lexical and accurately modeled.
-        if func.r#async || func.generator {
-            return false;
-        }
-        let flags = self.ctx.scoping.scope_flags(self.ctx.scoping.symbol_scope_id(symbol_id));
-        !flags.is_var() && !flags.is_strict_mode()
-    }
-
     /// Mark a symbol live and enqueue it for propagation; deduplicated at
     /// record time via the `live` bitset. Used for references in live
     /// context and for force-rooted position-ineligible declarations.
@@ -362,23 +385,6 @@ impl Collector<'_, '_> {
         walk(self);
         self.enclosing_candidate = saved_candidate;
         self.in_export = saved_export;
-    }
-
-    /// Init shapes `remove_unused_expression` fully drops when pure. Kinds
-    /// with specialized handlers can leave residue (a surviving expression
-    /// whose references would dangle once the cycle is removed), so they are
-    /// not candidates.
-    fn init_fully_removable(&self, init: Option<&Expression<'_>>) -> bool {
-        match init {
-            None
-            | Some(Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)) => {
-                true
-            }
-            Some(e) => {
-                !PeepholeOptimizations::expr_has_specialized_unused_handler(e)
-                    && !e.may_have_side_effects(&self.ctx)
-            }
-        }
     }
 }
 
@@ -434,8 +440,8 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         {
             if self.in_export
                 || !self.scope_allows_removal(self.depth())
-                || self.symbol_is_script_global(symbol_id)
-                || self.is_unmodeled_annex_b_alias(it, symbol_id)
+                || symbol_is_script_global(self.ctx.scoping, self.is_script, symbol_id)
+                || is_unmodeled_annex_b_alias(self.ctx.scoping, it, symbol_id)
             {
                 self.mark_live_root(symbol_id);
             } else {
@@ -452,7 +458,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         {
             if self.in_export
                 || !self.scope_allows_removal(self.depth())
-                || self.symbol_is_script_global(symbol_id)
+                || symbol_is_script_global(self.ctx.scoping, self.is_script, symbol_id)
             {
                 self.mark_live_root(symbol_id);
             } else if matches!(
@@ -484,9 +490,9 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             if let BindingPattern::BindingIdentifier(id) = &it.id
                 && let Some(symbol_id) = id.symbol_id.get()
             {
-                if self.symbol_is_script_global(symbol_id) {
+                if symbol_is_script_global(self.ctx.scoping, self.is_script, symbol_id) {
                     self.mark_live_root(symbol_id);
-                } else if self.init_fully_removable(it.init.as_ref()) {
+                } else if init_fully_removable(it.init.as_ref(), &self.ctx) {
                     candidate = Some(symbol_id);
                 }
             }
@@ -502,6 +508,396 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         }
         self.walk_declaration(candidate, |v| walk_variable_declarator(v, it));
     }
+}
+
+/// Per-pass in-traversal liveness collection: the peephole `Traverse` hooks
+/// record candidates, roots, and edges as the pass visits each node, so no
+/// standalone walk is needed to refresh the dead set. All buffers are
+/// `clear()`-reused across passes.
+pub struct LivenessCollect<'a> {
+    /// Collection is running this pass. Set at `enter_program` from
+    /// [`analysis_enabled`]; stable for the whole pass, so every hook's
+    /// enter/exit pair is balanced.
+    active: bool,
+    /// Candidates admitted this pass (per-site gates at enter time, on the
+    /// pre-fold shape — folds only purify, so this under-approves relative
+    /// to the settled tree: the sound direction, self-correcting next pass).
+    candidates: BitSet<'a>,
+    /// Marked at record time for roots, during propagation for edge targets.
+    live: BitSet<'a>,
+    /// The PREVIOUS pass's candidate set: record-time edge filter. A
+    /// reference whose target was not a candidate last pass is marked live
+    /// outright instead of recorded as an edge — junk targets (parameters,
+    /// gate-failing locals) never earn storage, and a genuinely NEW
+    /// candidate merely stays alive one extra pass.
+    prev_candidates: BitSet<'a>,
+    /// Deduplicated roots; doubles as the propagation worklist.
+    roots: ArenaVec<'a, SymbolId>,
+    /// `(innermost enclosing candidate, referenced candidate-kind symbol)`.
+    edges: ArenaVec<'a, (SymbolId, SymbolId)>,
+    /// Saved `current_candidate` values; one frame per declaration node
+    /// (function/class/declarator), pushed at enter, popped at exit.
+    frames: ArenaVec<'a, Option<SymbolId>>,
+    /// Innermost candidate whose deferred region the traversal is inside.
+    current_candidate: Option<SymbolId>,
+    /// Scratch for the next dead set; swapped with
+    /// `MinifierState::dead_symbols` at flush.
+    dead_next: BitSet<'a>,
+}
+
+impl<'a> LivenessCollect<'a> {
+    pub fn new(symbols_len: usize, allocator: &'a Allocator) -> Self {
+        Self {
+            active: false,
+            candidates: BitSet::new_in(symbols_len, allocator),
+            live: BitSet::new_in(symbols_len, allocator),
+            prev_candidates: BitSet::new_in(0, allocator),
+            roots: ArenaVec::new_in(&allocator),
+            edges: ArenaVec::new_in(&allocator),
+            frames: ArenaVec::new_in(&allocator),
+            current_candidate: None,
+            dead_next: BitSet::new_in(symbols_len, allocator),
+        }
+    }
+
+    /// Seed the edge filter from the standalone pre-loop walk's candidates.
+    pub fn seed_prev_candidates(&mut self, candidates: BitSet<'a>) {
+        self.prev_candidates = candidates;
+    }
+
+    fn reset_for_pass(&mut self, active: bool, symbols_len: usize, allocator: &'a Allocator) {
+        self.active = active;
+        self.current_candidate = None;
+        self.frames.clear();
+        if !active {
+            return;
+        }
+        self.roots.clear();
+        self.edges.clear();
+        // Symbols minted mid-pass are past these capacities and read as
+        // live everywhere (the `PassDirty::dead_refs` convention); their
+        // declarations enter the analysis next pass.
+        if self.candidates.capacity() == symbols_len {
+            self.candidates.clear();
+            self.live.clear();
+        } else {
+            self.candidates = BitSet::new_in(symbols_len, allocator);
+            self.live = BitSet::new_in(symbols_len, allocator);
+        }
+        if self.dead_next.capacity() == symbols_len {
+            self.dead_next.clear();
+        } else {
+            self.dead_next = BitSet::new_in(symbols_len, allocator);
+        }
+        // `prev_candidates` deliberately survives: it is the previous pass's
+        // output (or the pre-loop walk's), consumed as this pass's filter.
+    }
+
+    /// Mark a symbol live and enqueue it for propagation; deduplicated at
+    /// record time.
+    fn mark_live_root(&mut self, symbol_id: SymbolId) {
+        let index = symbol_id.index();
+        if index < self.live.capacity() && !self.live.has_bit(index) {
+            self.live.set_bit(index);
+            self.roots.push(symbol_id);
+        }
+    }
+
+    /// Admit a candidacy-eligible declaration; refuses mid-pass-minted
+    /// symbols (past capacity — they read as live and retry next pass).
+    fn admit_candidate(&mut self, symbol_id: SymbolId) -> bool {
+        let index = symbol_id.index();
+        if index < self.candidates.capacity() {
+            self.candidates.set_bit(index);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn push_region(&mut self, candidate: Option<SymbolId>) {
+        self.frames.push(self.current_candidate);
+        if candidate.is_some() {
+            self.current_candidate = candidate;
+        }
+    }
+
+    fn pop_region(&mut self) {
+        debug_assert!(!self.frames.is_empty(), "unbalanced liveness region frames");
+        self.current_candidate = self.frames.pop().unwrap_or(None);
+    }
+}
+
+/// `Traverse::enter_program` body: reset the collection for this pass.
+pub fn begin_pass(ctx: &mut TraverseCtx<'_>) {
+    let allocator = ctx.allocator();
+    let TraverseCtx { state, scoping, .. } = ctx;
+    let enabled = analysis_enabled(scoping.scoping(), &state.options);
+    let symbols_len = scoping.scoping().symbols_len();
+    state.liveness.reset_for_pass(enabled, symbols_len, allocator);
+    // Discard mint logs from outside the loop (Normalize's mints are settled
+    // tree by the time the pre-loop walk runs).
+    scoping.clear_minted_symbols();
+}
+
+/// `Traverse::enter_identifier_reference` body. Runs for every
+/// `IdentifierReference` (including assignment targets), so the inactive
+/// path is one load and branch.
+pub fn collect_identifier_reference<'a>(
+    ident: &IdentifierReference<'a>,
+    ctx: &mut TraverseCtx<'a>,
+) {
+    let TraverseCtx { state, scoping, .. } = ctx;
+    let lv = &mut state.liveness;
+    if !lv.active {
+        return;
+    }
+    let scoping = scoping.scoping();
+    let Some(reference_id) = ident.reference_id.get() else { return };
+    let Some(symbol_id) = scoping.get_reference(reference_id).symbol_id() else { return };
+    if !scoping.symbol_flags(symbol_id).intersects(CANDIDATE_KINDS) {
+        return;
+    }
+    match lv.current_candidate {
+        None => lv.mark_live_root(symbol_id),
+        Some(from) => {
+            if lv.prev_candidates.contains(symbol_id.index()) {
+                lv.edges.push((from, symbol_id));
+            } else {
+                lv.mark_live_root(symbol_id);
+            }
+        }
+    }
+}
+
+fn parent_is_export(parent: Ancestor<'_, '_>) -> bool {
+    matches!(
+        parent,
+        Ancestor::ExportNamedDeclarationDeclaration(_)
+            | Ancestor::ExportDefaultDeclarationDeclaration(_)
+    )
+}
+
+/// `Traverse::enter_function` body: decide candidacy at the same position
+/// the removal site evaluates (the hook fires before the function's scope is
+/// entered, so `current_scope_id` is the containing scope — identical to the
+/// `exit_statement` frame that runs `remove_unused_function_declaration`).
+pub fn collect_enter_function<'a>(func: &Function<'a>, ctx: &mut TraverseCtx<'a>) {
+    if !ctx.state.liveness.active {
+        return;
+    }
+    let mut candidate = None;
+    let mut force_root = None;
+    if func.is_declaration()
+        && let Some(symbol_id) = func.id.as_ref().and_then(|id| id.symbol_id.get())
+    {
+        let scoping = ctx.scoping();
+        let is_script = ctx.state.source_type.is_script();
+        let position_fail = parent_is_export(ctx.parent())
+            || (is_script && ctx.current_scope_id() == scoping.root_scope_id())
+            || symbol_is_script_global(scoping, is_script, symbol_id)
+            || is_unmodeled_annex_b_alias(scoping, func, symbol_id);
+        if position_fail {
+            force_root = Some(symbol_id);
+        } else {
+            candidate = Some(symbol_id);
+        }
+    }
+    let lv = &mut ctx.state.liveness;
+    if let Some(symbol_id) = force_root {
+        lv.mark_live_root(symbol_id);
+    }
+    let candidate = candidate.filter(|&symbol_id| lv.admit_candidate(symbol_id));
+    lv.push_region(candidate);
+}
+
+/// `Traverse::enter_class` body; see [`collect_enter_function`].
+pub fn collect_enter_class<'a>(class: &Class<'a>, ctx: &mut TraverseCtx<'a>) {
+    if !ctx.state.liveness.active {
+        return;
+    }
+    let mut candidate = None;
+    let mut force_root = None;
+    if class.is_declaration()
+        && let Some(symbol_id) = class.id.as_ref().and_then(|id| id.symbol_id.get())
+    {
+        let scoping = ctx.scoping();
+        let is_script = ctx.state.source_type.is_script();
+        let position_fail = parent_is_export(ctx.parent())
+            || (is_script && ctx.current_scope_id() == scoping.root_scope_id())
+            || symbol_is_script_global(scoping, is_script, symbol_id);
+        if position_fail {
+            force_root = Some(symbol_id);
+        } else if matches!(
+            PeepholeOptimizations::classify_class_removability(
+                class,
+                &LivenessCtx { scoping, options: &ctx.state.options }
+            ),
+            ClassRemovability::RemovesClean
+        ) {
+            // Shape failures (`Keep` / `Extracts`) do NOT force-root: the
+            // class survives whole, or its extraction's references were
+            // never deferred (non-candidates attribute outward).
+            candidate = Some(symbol_id);
+        }
+    }
+    let lv = &mut ctx.state.liveness;
+    if let Some(symbol_id) = force_root {
+        lv.mark_live_root(symbol_id);
+    }
+    let candidate = candidate.filter(|&symbol_id| lv.admit_candidate(symbol_id));
+    lv.push_region(candidate);
+}
+
+/// `Traverse::enter_variable_declarator` body. Position gates come from
+/// ancestry, which matches the removal sites exactly: the for-init retain
+/// runs at the scope containing the `for` statement (the walk has already
+/// entered the for's own scope here), and for-in/of heads have no removal
+/// site at all.
+pub fn collect_enter_variable_declarator<'a>(
+    decl: &VariableDeclarator<'a>,
+    ctx: &mut TraverseCtx<'a>,
+) {
+    if !ctx.state.liveness.active {
+        return;
+    }
+    let grandparent = ctx.ancestor(1);
+    let in_export = matches!(grandparent, Ancestor::ExportNamedDeclarationDeclaration(_));
+    let in_for_head =
+        matches!(grandparent, Ancestor::ForInStatementLeft(_) | Ancestor::ForOfStatementLeft(_));
+    let scoping = ctx.scoping();
+    let is_script = ctx.state.source_type.is_script();
+    let statement_scope = if matches!(grandparent, Ancestor::ForStatementInit(_)) {
+        scoping.scope_parent_id(ctx.current_scope_id()).unwrap_or_else(|| ctx.current_scope_id())
+    } else {
+        ctx.current_scope_id()
+    };
+    let position_fail = in_export
+        || in_for_head
+        || decl.kind.is_using()
+        || (is_script && statement_scope == scoping.root_scope_id());
+    let mut candidate = None;
+    let mut force_root = None;
+    if !position_fail
+        && let BindingPattern::BindingIdentifier(id) = &decl.id
+        && let Some(symbol_id) = id.symbol_id.get()
+    {
+        if symbol_is_script_global(scoping, is_script, symbol_id) {
+            force_root = Some(symbol_id);
+        } else if init_fully_removable(
+            decl.init.as_ref(),
+            &LivenessCtx { scoping, options: &ctx.state.options },
+        ) {
+            candidate = Some(symbol_id);
+        }
+    }
+    let lv = &mut ctx.state.liveness;
+    if position_fail {
+        // Position-ineligible site: force-root every symbol it binds (see
+        // the module doc). Shape failures land in the arm above and
+        // deliberately do not force-root.
+        decl.id.bound_names(&mut |ident| {
+            if let Some(symbol_id) = ident.symbol_id.get() {
+                lv.mark_live_root(symbol_id);
+            }
+        });
+    }
+    if let Some(symbol_id) = force_root {
+        lv.mark_live_root(symbol_id);
+    }
+    let candidate = candidate.filter(|&symbol_id| lv.admit_candidate(symbol_id));
+    lv.push_region(candidate);
+}
+
+/// `Traverse::exit_function` / `exit_class` / `exit_variable_declarator`
+/// body: close the region opened by the matching enter hook.
+pub fn collect_exit_region(ctx: &mut TraverseCtx<'_>) {
+    let lv = &mut ctx.state.liveness;
+    if lv.active {
+        lv.pop_region();
+    }
+}
+
+/// Consume the pass's collection: force-root symbols that received freshly
+/// minted references (the one toward-dead divergence of in-pass collection),
+/// propagate liveness, refresh `MinifierState::dead_symbols`, and report
+/// whether the driver must run another pass:
+///
+/// - a NEW dead symbol appeared — its removal must be consumed with the
+///   same one-pass freshness as everything else; or
+/// - the candidate set GREW — references to a candidate the edge filter had
+///   not seen yet were conservatively rooted (kept alive), so one more pass
+///   is needed for the filter to defer them. Without this, a candidate that
+///   first becomes eligible on the loop's final pass would silently survive
+///   (e.g. the whole analysis coming online after the last direct eval is
+///   dropped, or an init folding into an eligible shape).
+///
+/// Both continue reasons are bounded: dead and candidate bits only ever
+/// come from the symbol table, and on an unchanged tree a repeat pass
+/// collects the identical candidate set, so a quiet re-run converges
+/// immediately.
+///
+/// Must run after `flush_pass_dirty` so the debug ground-truth walk sees
+/// post-flush scoping.
+pub fn propagate_collected<'a>(
+    #[cfg_attr(not(debug_assertions), expect(unused_variables))] program: &Program<'a>,
+    ctx: &mut TraverseCtx<'a>,
+) -> bool {
+    // `allocator` and `options` feed only the debug ground-truth walk below.
+    #[cfg_attr(not(debug_assertions), expect(unused_variables))]
+    let allocator = ctx.allocator();
+    let TraverseCtx { state, scoping, .. } = ctx;
+    #[cfg_attr(not(debug_assertions), expect(unused_variables))]
+    let crate::state::MinifierState { liveness, dead_symbols, options, .. } = state;
+    let lv = liveness;
+    if !lv.active {
+        // Keep the mint log bounded even when the analysis is off.
+        scoping.clear_minted_symbols();
+        return false;
+    }
+    debug_assert!(lv.frames.is_empty(), "unbalanced liveness region frames at flush");
+
+    // References minted behind the traversal cursor were never visited by
+    // the collection; their targets must be live.
+    for &symbol_id in scoping.minted_symbols() {
+        lv.mark_live_root(symbol_id);
+    }
+    scoping.clear_minted_symbols();
+
+    propagate(&lv.candidates, &mut lv.live, &mut lv.roots, &mut lv.edges);
+
+    for candidate in lv.candidates.ones() {
+        if !lv.live.contains(candidate) {
+            lv.dead_next.set_bit(candidate);
+        }
+    }
+
+    let found_new_dead = lv.dead_next.ones().any(|bit| !dead_symbols.contains(bit));
+    let candidates_grew = lv.candidates.ones().any(|bit| !lv.prev_candidates.contains(bit));
+
+    // Ground-truth net: everything the in-pass collection calls dead must be
+    // dead per a standalone walk of the settled tree — for symbols whose
+    // declarations still exist (a declaration removed this pass legitimately
+    // lingers in the stale set for one flush, with nothing left to remove).
+    // Runs only when the set is non-empty (the subset check is vacuous
+    // otherwise), so the whole test and conformance corpus doubles as a
+    // collection-vs-truth differ at zero release cost.
+    #[cfg(debug_assertions)]
+    if !lv.dead_next.is_empty() {
+        let (walk_dead, walk_candidates) =
+            compute_dead_symbols(program, scoping.scoping(), options, allocator);
+        for bit in lv.dead_next.ones() {
+            assert!(
+                !walk_candidates.contains(bit) || walk_dead.contains(bit),
+                "in-pass liveness collection marked symbol {bit} dead but the ground-truth walk \
+                 sees it live",
+            );
+        }
+    }
+
+    std::mem::swap(dead_symbols, &mut lv.dead_next);
+    std::mem::swap(&mut lv.prev_candidates, &mut lv.candidates);
+    found_new_dead || candidates_grew
 }
 
 /// Debug backstop for the residue path in `handle_variable_declaration`:

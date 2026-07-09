@@ -121,9 +121,10 @@ impl<'a> Compressor<'a> {
         // counts and Normalize's drops cost no extra peephole pass.
         PeepholeOptimizations::flush_pass_dirty(program, ctx.get_mut());
         // Initial liveness: reference cycles that are dead in the source
-        // (`function f() { f() }`) must be visible to pass 1. Later
-        // iterations recompute only when a flush reports a transition that
-        // can newly kill a cycle (see `flush_pass_dirty`).
+        // (`function f() { f() }`) must be visible to pass 1. This is the
+        // only standalone walk — during the loop the peephole traversal
+        // itself collects the analysis inputs and every flush refreshes the
+        // set (see `symbol_liveness`).
         Self::update_dead_symbols(program, ctx.get_mut());
         // Start the loop from a clean signal: Normalize's drops are flushed
         // above, so a Normalize-only mutation must not force a pointless
@@ -131,14 +132,24 @@ impl<'a> Compressor<'a> {
         ctx.state_mut().take_mutated();
         loop {
             PeepholeOptimizations.run_once(program, ctx);
-            // A pass with no recorded mutation cannot have recorded drops
-            // (every drop helper also records a mutation), so the terminal
-            // iteration skips the flush.
-            if !ctx.state_mut().take_mutated() {
+            let mutated = ctx.state_mut().take_mutated();
+            // Flush and consume the liveness collection even on quiet
+            // passes (every flush step is a cheap no-op then): pass N's
+            // late mutations can kill a cycle that only pass N+1's —
+            // otherwise quiet — collection observes. Stopping without
+            // consuming it would strand the removal; deferring consumption
+            // to the fixed point was measured to LOSE output (other passes
+            // rewrite late-exposed dead cycles into non-candidate shapes),
+            // so one-pass staleness is the freshness contract.
+            PeepholeOptimizations::flush_pass_dirty(program, ctx.get_mut());
+            let needs_liveness_pass = symbol_liveness::propagate_collected(program, ctx.get_mut());
+            // Convergence: another pass is demanded only for a dead symbol
+            // or candidate absent from the previous set (both bounded by
+            // the symbol table, and a quiet re-run collects an identical
+            // set — see `propagate_collected`); the iteration cap backstops
+            // pathological churn.
+            if !mutated && !needs_liveness_pass {
                 break;
-            }
-            if PeepholeOptimizations::flush_pass_dirty(program, ctx.get_mut()) {
-                Self::update_dead_symbols(program, ctx.get_mut());
             }
             if let Some(max) = max_iterations {
                 if iteration >= max {
@@ -159,16 +170,18 @@ impl<'a> Compressor<'a> {
         iteration
     }
 
-    /// Recompute the whole-program symbol-liveness set consumed by the
-    /// unused-declaration removal sites (#13105). Must run against
-    /// freshly-flushed scoping.
+    /// Compute the initial whole-program symbol-liveness set consumed by the
+    /// unused-declaration removal sites (#13105), and seed the in-pass
+    /// collection's edge filter with the walk's candidate set. Must run
+    /// against freshly-flushed scoping.
     fn update_dead_symbols(program: &Program<'a>, ctx: &mut TraverseCtx<'a>) {
-        let dead = symbol_liveness::compute_dead_symbols(
+        let (dead, candidates) = symbol_liveness::compute_dead_symbols(
             program,
             ctx.scoping(),
             &ctx.state.options,
             ctx.allocator(),
         );
         ctx.state.dead_symbols = dead;
+        ctx.state.liveness.seed_prev_candidates(candidates);
     }
 }
