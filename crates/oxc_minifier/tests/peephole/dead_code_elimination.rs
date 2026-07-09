@@ -718,6 +718,9 @@ fn dce_keeps_write_only_property_assignments() {
 fn dce_recursive_unused_functions() {
     test("function f() { f() }", "");
     test("function c() { d() } function d() { c() }", "");
+    // Cycle whose only external root sits in dead code: needs the mid-loop
+    // recompute trigger (pass 2), not just the initial compute.
+    test("if (false) c(); function c() { d() } function d() { c() }", "");
     // Live references root the cycle.
     test_same("function f() {\n\tf();\n}\nconsole.log(f);");
     test_same("export function f() {\n\tf();\n}");

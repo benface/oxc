@@ -472,6 +472,121 @@ fn keep_recursive_function_with_unused_keep_option() {
     test_same_options("function f() { f() }", &options);
 }
 
+// Candidacy is granted per declaration SITE but the dead bit is consumed per
+// SYMBOL, so a declaration site the removal machinery can never remove —
+// export-wrapped, script top-level (including bindings var-hoisted to the
+// script root from inside blocks), for-in/of heads, Annex-B block-level
+// functions — must force-root its symbol: one ineligible site keeps the
+// whole symbol alive even when another site of the same symbol is removable.
+#[test]
+fn keep_recursive_cycle_with_exported_redeclaration() {
+    // `export var f;` carries no reference, but importers observe the
+    // binding: removing the initializing redeclaration would export
+    // undefined.
+    test_same_smallest("export var f; var f = function() { setTimeout(f) };");
+}
+
+#[test]
+fn keep_recursive_cycle_in_script_mode_positions() {
+    let options = CompressOptions::smallest();
+    let source_type = SourceType::cjs().with_script(true);
+    // A top-level for-init declarator's removal site runs at the scope
+    // CONTAINING the for statement — the protected script root — so it can
+    // never be removed there, and its cycle peers must stay alive too. (The
+    // var-only blocks flatten into the parent; the bindings must survive.)
+    test_options_source_type(
+        "for (var f = g;;) break; { var g = function() { f() }; } console.log('done');",
+        "for (var f = g;;) break; var g = function() { f() }; console.log('done');",
+        source_type,
+        &options,
+    );
+    test_options_source_type(
+        "{ var p = function() { f() }; } for (let f = p;;) break;",
+        "var p = function() { f() }; for (let f = p;;) break;",
+        source_type,
+        &options,
+    );
+    // A var inside a block still binds at the script root (var hoisting), so
+    // cross-script access can observe it exactly like a top-level statement.
+    test_options_source_type(
+        "{ var g = function() { g() }; }",
+        "var g = function() { g() };",
+        source_type,
+        &options,
+    );
+    test_options_source_type(
+        "var f; { var f = function() { f() }; }",
+        "var f, f = function() { f() };",
+        source_type,
+        &options,
+    );
+}
+
+#[test]
+fn keep_recursive_cycle_in_for_in_head() {
+    // No removal site handles for-in/of head declarators, so the head
+    // survives; its Annex-B initializer must keep referencing a live `p`.
+    let options = CompressOptions::smallest();
+    let source_type = SourceType::cjs().with_script(true);
+    test_same_options_source_type(
+        "function o() { var p = function() { console.log(x) }; for (var x = p in {}); return 1; } g(o());",
+        source_type,
+        &options,
+    );
+}
+
+#[test]
+fn keep_annex_b_block_level_function() {
+    let options = CompressOptions::smallest();
+    let source_type = SourceType::cjs().with_script(true);
+    // A sloppy block-level function declaration also assigns a var-alias
+    // binding at runtime (Annex B.3.3), and `Scoping` resolves outer
+    // references to the FIRST same-named block function only, so later
+    // duplicates' runtime re-assignments are invisible to reference
+    // resolution. None of these declarations are safe liveness candidates.
+    // (The zero-reference variant `{ function f() {} }` is still removed by
+    // the count-based path — pre-existing.)
+    test_same_options_source_type("{ function f() { f() } }", source_type, &options);
+    test_same_options_source_type(
+        "function o() { { function f() { console.log(1) } } f(); { function f() { console.log(2), g(f) } } f(); } o();",
+        source_type,
+        &options,
+    );
+    // Annex B applies to any sloppy code, not just script mode: `.cjs`
+    // (rolldown's CommonJS source type) is sloppy but not `is_script`.
+    test_same_options_source_type(
+        "function o() { { function f() { console.log(1) } } f(); { function f() { console.log(2), g(f) } } f(); } o();",
+        SourceType::cjs(),
+        &options,
+    );
+}
+
+// A symbol declared both by a candidate site and a non-candidate site must
+// stay consistent at BOTH removal sites.
+#[test]
+fn recursive_function_with_var_redeclaration() {
+    // The array init has a specialized (residue-leaving) handler, so the
+    // declarator site is a non-candidate and its references root from live
+    // context: the function site's removal is enabled, the residue survives.
+    test_smallest("function f() { f() } var f = [g()];", "g();");
+    test_same_smallest("function f() { f() } var f = [f];");
+}
+
+// Module-mode for-init declarators have no script protection and keep being
+// removed.
+#[test]
+fn remove_recursive_for_init_declarator_in_module() {
+    test_smallest("for (let f = () => f();;) break;", "for (;;) break;");
+}
+
+// A dropped direct eval must re-enable the analysis: the initial compute
+// skips the whole program while the root scope carries `DirectEval`, so only
+// the `eval_dropped` recompute trigger lets a later pass remove the cycle.
+#[test]
+fn remove_recursive_function_after_eval_dropped() {
+    test_smallest("if (false) eval('x'); function f() { f() }", "");
+}
+
 #[test]
 fn remove_unused_import_specifiers() {
     let options = CompressOptions::smallest();

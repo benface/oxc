@@ -24,9 +24,10 @@
 //!   `ScopeFlags::DirectEval` (mirrors `can_remove_unused_declarators`; the
 //!   flag propagates to the root from any direct eval in the program, so this
 //!   also subsumes the per-site current-scope checks).
-//! - script-mode: statements visited at the root scope are non-candidates
-//!   (mirrors `keep_top_level_var_in_script_mode`, which compares the
-//!   *visitation* scope, not the symbol's scope).
+//! - script-mode: statements whose removal site runs at the root scope are
+//!   position-ineligible (mirrors `keep_top_level_var_in_script_mode`, which
+//!   compares the *visitation* scope of the removal site — for a for-init
+//!   declarator that is one scope above the declarator itself).
 //! - declarator inits must be dropped whole by `remove_unused_expression`:
 //!   kinds with specialized handlers there can leave residue, so candidacy
 //!   excludes them via the shared
@@ -35,6 +36,33 @@
 //!   [`PeepholeOptimizations::classify_class_removability`] (shared with
 //!   `remove_unused_class` itself) to return `RemovesClean` — removal must
 //!   not bail AND must extract nothing into live code.
+//!
+//! ## Per-symbol candidacy: position failures force-root
+//!
+//! Candidacy is granted per declaration SITE, but the dead bit is consumed
+//! per SYMBOL — and `var`s redeclare. A site that fails a POSITION gate is
+//! not merely a non-candidate: it force-roots the symbols it binds (marks
+//! them live outright), because otherwise a removable sibling site of the
+//! same symbol could strip the initializer while the ineligible site keeps
+//! the binding observable. Position gates:
+//!
+//! - export-wrapped declarations (`export var f;` carries no reference, yet
+//!   importers observe the binding);
+//! - script-mode bindings that live in the ROOT scope wherever their
+//!   statement sits (a block `var` hoists its BINDING to the root, where
+//!   other scripts observe it), plus the visitation-root mirror above;
+//! - for-in/of head declarators (no removal site handles them at all);
+//! - Annex B block-level function declarations in sloppy code whose binding
+//!   was NOT hoisted into the var scope (the binder hoists only the first
+//!   same-named function per var scope, so a later duplicate's runtime
+//!   var-alias re-assignment is invisible to reference resolution);
+//! - `using` declarators (removal always bails on them).
+//!
+//! SHAPE failures (residue-leaving init kinds, destructuring patterns,
+//! `Extracts`/`Keep` classes) do NOT force-root: such a site either keeps
+//! its declaration (still binding the symbol) or leaves residue whose
+//! references were never deferred — they attribute to the enclosing region
+//! and root the peers on their own.
 //!
 //! Side-effect judgments here use a context with strictly less information
 //! than the peephole `TraverseCtx` (no tracked constant values). Extra
@@ -57,12 +85,12 @@ use oxc_ast::ast::*;
 use oxc_ast_visit::{
     Visit,
     walk::{
-        walk_class, walk_export_default_declaration, walk_export_named_declaration, walk_function,
-        walk_variable_declarator,
+        walk_class, walk_export_default_declaration, walk_export_named_declaration,
+        walk_for_statement_init, walk_for_statement_left, walk_function, walk_variable_declarator,
     },
 };
 use oxc_ecmascript::{
-    GlobalContext,
+    BoundNames, GlobalContext,
     side_effects::{
         MayHaveSideEffects, MayHaveSideEffectsContext, PropertyReadSideEffects, is_pure_function,
     },
@@ -186,6 +214,8 @@ pub fn compute_dead_symbols<'a>(
         ctx: LivenessCtx { scoping, options },
         is_script: program.source_type.is_script(),
         scope_depth: 0,
+        for_init_depth: None,
+        for_head_depth: None,
         in_export: false,
         enclosing_candidate: None,
         candidates: BitSet::new_in(symbols_len, allocator),
@@ -236,6 +266,14 @@ struct Collector<'a, 'b> {
     is_script: bool,
     /// Scope nesting depth; 1 = the program (root) scope.
     scope_depth: usize,
+    /// Depth at which a `ForStatementInit` subtree is being visited (the
+    /// for's own scope is already entered). Its direct declarators' removal
+    /// site runs one scope above; the exact-depth match leaves declarators
+    /// nested deeper inside the init (function bodies) unadjusted.
+    for_init_depth: Option<usize>,
+    /// Depth at which a `ForStatementLeft` (for-in/of head) subtree is being
+    /// visited. Head declarators have no removal site at all.
+    for_head_depth: Option<usize>,
     /// The visited node is the `declaration` of an export statement (or a
     /// sibling declarator of one). Cleared for the declaration's subtree so
     /// declarations nested inside an exported function/class stay eligible.
@@ -245,18 +283,65 @@ struct Collector<'a, 'b> {
     candidates: BitSet<'a>,
     /// Marked at record time for roots, during propagation for edge targets.
     live: BitSet<'a>,
-    /// Deduplicated live-context references to candidate-kind symbols; the
-    /// propagation worklist.
+    /// Deduplicated live-context references to candidate-kind symbols (plus
+    /// force-rooted position-ineligible declarations); the propagation
+    /// worklist.
     roots: ArenaVec<'a, SymbolId>,
     /// `(innermost enclosing candidate, referenced candidate-kind symbol)`.
+    /// May contain duplicates (one entry per reference); propagation dedups
+    /// via the `live` bitset.
     edges: ArenaVec<'a, (SymbolId, SymbolId)>,
 }
 
 impl Collector<'_, '_> {
+    fn depth(&self) -> usize {
+        self.scope_depth
+    }
+
     /// `keep_top_level_var_in_script_mode` mirror: script-mode statements
-    /// visited at the root scope are not removable.
-    fn scope_allows_removal(&self) -> bool {
-        !(self.is_script && self.scope_depth <= 1)
+    /// whose removal site runs at the root scope are not removable. `depth`
+    /// is the visitation depth of that removal site.
+    fn scope_allows_removal(&self, depth: usize) -> bool {
+        !(self.is_script && depth <= 1)
+    }
+
+    /// In script mode a binding that lives in the ROOT scope is observable
+    /// by other scripts (global object property / global lexical binding)
+    /// no matter where its declaration statement sits: a block `var` hoists
+    /// its BINDING to the root while its statement stays at removable block
+    /// depth.
+    fn symbol_is_script_global(&self, symbol_id: SymbolId) -> bool {
+        self.is_script
+            && self.ctx.scoping.symbol_scope_id(symbol_id) == self.ctx.scoping.root_scope_id()
+    }
+
+    /// Annex B.3.3: in sloppy code, a plain block-level function declaration
+    /// also creates a runtime var-alias binding in the enclosing var scope.
+    /// The binder models that alias by MOVING the first same-named
+    /// function's binding into the var scope (accurate — references resolve
+    /// to it); a plain function whose binding still sits in a sloppy non-var
+    /// scope is a later duplicate (or a blocked hoist), whose runtime
+    /// re-assignment of the alias is invisible to reference resolution — no
+    /// such declaration is a safe candidate. Applies to sloppy non-script
+    /// code too (`.cjs`), so this checks strictness, not `is_script`.
+    fn is_unmodeled_annex_b_alias(&self, func: &Function<'_>, symbol_id: SymbolId) -> bool {
+        // Annex B.3.3 covers plain functions only; async/generator block
+        // functions are purely lexical and accurately modeled.
+        if func.r#async || func.generator {
+            return false;
+        }
+        let flags = self.ctx.scoping.scope_flags(self.ctx.scoping.symbol_scope_id(symbol_id));
+        !flags.is_var() && !flags.is_strict_mode()
+    }
+
+    /// Mark a symbol live and enqueue it for propagation; deduplicated at
+    /// record time via the `live` bitset. Used for references in live
+    /// context and for force-rooted position-ineligible declarations.
+    fn mark_live_root(&mut self, symbol_id: SymbolId) {
+        if !self.live.contains(symbol_id.index()) {
+            self.live.set_bit(symbol_id.index());
+            self.roots.push(symbol_id);
+        }
     }
 
     /// Shared visitor skeleton for the three declaration kinds: clear
@@ -307,12 +392,7 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
             && self.ctx.scoping.symbol_flags(symbol_id).intersects(CANDIDATE_KINDS)
         {
             match self.enclosing_candidate {
-                None => {
-                    if !self.live.contains(symbol_id.index()) {
-                        self.live.set_bit(symbol_id.index());
-                        self.roots.push(symbol_id);
-                    }
-                }
+                None => self.mark_live_root(symbol_id),
                 Some(from) => self.edges.push((from, symbol_id)),
             }
         }
@@ -330,43 +410,91 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         self.in_export = saved;
     }
 
+    fn visit_for_statement_init(&mut self, it: &ForStatementInit<'a>) {
+        let saved = self.for_init_depth.replace(self.depth());
+        walk_for_statement_init(self, it);
+        self.for_init_depth = saved;
+    }
+
+    fn visit_for_statement_left(&mut self, it: &ForStatementLeft<'a>) {
+        let saved = self.for_head_depth.replace(self.depth());
+        walk_for_statement_left(self, it);
+        self.for_head_depth = saved;
+    }
+
     fn visit_function(&mut self, it: &Function<'a>, flags: ScopeFlags) {
-        let candidate = if it.is_declaration() && !self.in_export && self.scope_allows_removal() {
-            it.id.as_ref().and_then(|id| id.symbol_id.get())
-        } else {
-            None
-        };
+        let mut candidate = None;
+        if it.is_declaration()
+            && let Some(symbol_id) = it.id.as_ref().and_then(|id| id.symbol_id.get())
+        {
+            if self.in_export
+                || !self.scope_allows_removal(self.depth())
+                || self.symbol_is_script_global(symbol_id)
+                || self.is_unmodeled_annex_b_alias(it, symbol_id)
+            {
+                self.mark_live_root(symbol_id);
+            } else {
+                candidate = Some(symbol_id);
+            }
+        }
         self.walk_declaration(candidate, |v| walk_function(v, it, flags));
     }
 
     fn visit_class(&mut self, it: &Class<'a>) {
-        let candidate = if it.is_declaration()
-            && !self.in_export
-            && self.scope_allows_removal()
-            && matches!(
+        let mut candidate = None;
+        if it.is_declaration()
+            && let Some(symbol_id) = it.id.as_ref().and_then(|id| id.symbol_id.get())
+        {
+            if self.in_export
+                || !self.scope_allows_removal(self.depth())
+                || self.symbol_is_script_global(symbol_id)
+            {
+                self.mark_live_root(symbol_id);
+            } else if matches!(
                 PeepholeOptimizations::classify_class_removability(it, &self.ctx),
                 ClassRemovability::RemovesClean
             ) {
-            it.id.as_ref().and_then(|id| id.symbol_id.get())
-        } else {
-            None
-        };
+                // Shape failures (`Keep` / `Extracts`) do NOT force-root:
+                // the class survives whole, or its extraction's references
+                // were never deferred (non-candidates attribute outward).
+                candidate = Some(symbol_id);
+            }
+        }
         self.walk_declaration(candidate, |v| walk_class(v, it));
     }
 
     fn visit_variable_declarator(&mut self, it: &VariableDeclarator<'a>) {
-        let candidate = if !self.in_export
-            && self.scope_allows_removal()
+        // The for-init removal site (`handle_for_statement`'s retain) runs
+        // while the traversal sits at the scope CONTAINING the for statement
+        // — one level above this visit, since the walk has already entered
+        // the for's own scope. Mirror its script-root gate at that depth.
+        let statement_depth =
+            if self.for_init_depth == Some(self.depth()) { self.depth() - 1 } else { self.depth() };
+        let site_removable = !self.in_export
+            && self.for_head_depth != Some(self.depth())
             && !it.kind.is_using()
-            && self.init_fully_removable(it.init.as_ref())
-        {
-            match &it.id {
-                BindingPattern::BindingIdentifier(id) => id.symbol_id.get(),
-                _ => None,
+            && self.scope_allows_removal(statement_depth);
+        let mut candidate = None;
+        if site_removable {
+            if let BindingPattern::BindingIdentifier(id) = &it.id
+                && let Some(symbol_id) = id.symbol_id.get()
+            {
+                if self.symbol_is_script_global(symbol_id) {
+                    self.mark_live_root(symbol_id);
+                } else if self.init_fully_removable(it.init.as_ref()) {
+                    candidate = Some(symbol_id);
+                }
             }
         } else {
-            None
-        };
+            // Position-ineligible site: force-root every symbol it binds
+            // (see the module doc). Shape failures land in the `if` arm
+            // above and deliberately do not force-root.
+            it.id.bound_names(&mut |ident| {
+                if let Some(symbol_id) = ident.symbol_id.get() {
+                    self.mark_live_root(symbol_id);
+                }
+            });
+        }
         self.walk_declaration(candidate, |v| walk_variable_declarator(v, it));
     }
 }
