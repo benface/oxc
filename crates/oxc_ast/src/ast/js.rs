@@ -45,6 +45,7 @@ use super::*;
 #[scope(
     flags = ScopeFlags::Top,
     strict_if = self.source_type.is_strict() || self.has_use_strict_directive(),
+    ambient_if = self.source_type.is_typescript_definition()
 )]
 #[derive(Debug)]
 #[generate_derive(CloneIn, Dummy, ReplaceWith, TakeIn)]
@@ -1732,6 +1733,7 @@ pub struct BindingRestElement<'a> {
 #[scope(
     // `flags` passed in to visitor via parameter defined by `#[visit(args(flags = ...))]` on parents
     flags = flags,
+    ambient_if = self.declare,
     strict_if = self.has_use_strict_directive(),
 )]
 #[derive(Debug)]
@@ -2009,7 +2011,7 @@ pub struct YieldExpression<'a> {
 
 /// Class Definitions
 #[ast(visit)]
-#[scope(flags = ScopeFlags::StrictMode)]
+#[scope(flags = ScopeFlags::StrictMode, ambient_if = self.declare)]
 #[derive(Debug)]
 #[generate_derive(CloneIn, Dummy, ReplaceWith, TakeIn)]
 #[generate_derive(ContentEq, ESTree, GetSpan, GetSpanMut, UnstableAddress)]

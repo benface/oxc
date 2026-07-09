@@ -14,21 +14,21 @@ input_file: crates/oxc_semantic/tests/fixtures/oxc/ts/declare-class-heritage.ts
       },
       {
         "children": [],
-        "flags": "ScopeFlags(StrictMode)",
+        "flags": "ScopeFlags(StrictMode | Ambient)",
         "id": 2,
         "node": "Class(Declared)",
         "symbols": []
       },
       {
         "children": [],
-        "flags": "ScopeFlags(StrictMode)",
+        "flags": "ScopeFlags(StrictMode | Ambient)",
         "id": 3,
         "node": "Class(NamespaceDeclared)",
         "symbols": []
       },
       {
         "children": [],
-        "flags": "ScopeFlags(StrictMode)",
+        "flags": "ScopeFlags(StrictMode | Ambient)",
         "id": 4,
         "node": "Class(LocalDeclared)",
         "symbols": []

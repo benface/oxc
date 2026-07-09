@@ -412,20 +412,8 @@ impl<'a> SemanticBuilder<'a> {
         self.node_store.ancestry()
     }
 
-    fn is_declare_class_element(&self) -> bool {
-        // Class elements are children of `ClassBody`, whose parent is `Class`.
-        matches!(
-            self.ancestry().ancestor_kinds().nth(1),
-            Some(AstKind::Class(class)) if class.declare
-        )
-    }
-
-    pub(crate) fn in_declare_scope(&self) -> bool {
-        self.source_type.is_typescript_definition()
-            || self
-                .scoping
-                .scope_ancestors(self.current_scope_id)
-                .any(|scope_id| self.scoping.scope_flags(scope_id).is_ts_module_block())
+    pub(crate) fn in_ambient_scope(&self) -> bool {
+        self.current_scope_flags().is_ambient()
     }
 
     fn create_ast_node(&mut self, kind: AstKind<'a>) {
@@ -887,6 +875,9 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
         if self.source_type.is_strict() || program.has_use_strict_directive() {
             flags |= ScopeFlags::StrictMode;
         }
+        if self.source_type.is_typescript_definition() {
+            flags |= ScopeFlags::Ambient;
+        }
         self.current_scope_id =
             self.scoping.add_scope(None, self.node_store.current_node_id, flags);
         program.scope_id.set(Some(self.current_scope_id));
@@ -950,7 +941,11 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
         }
 
         self.visit_decorators(&class.decorators);
-        self.enter_scope(ScopeFlags::StrictMode, &class.scope_id);
+        self.enter_scope(
+            ScopeFlags::StrictMode
+                | if class.declare { ScopeFlags::Ambient } else { ScopeFlags::empty() },
+            &class.scope_id,
+        );
 
         if class.is_expression() {
             // We need to bind class expressions in the class scope before visiting the identifier.
@@ -965,7 +960,7 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
             self.visit_ts_type_parameter_declaration(type_parameters);
         }
         if let Some(super_class) = &class.super_class {
-            if class.declare {
+            if self.in_ambient_scope() {
                 self.current_reference_flags = ReferenceFlags::ValueAsType;
             }
             self.visit_expression(super_class);
@@ -2028,6 +2023,9 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
         self.enter_scope(
             {
                 let mut flags = flags;
+                if func.declare {
+                    flags |= ScopeFlags::Ambient;
+                }
                 if func.has_use_strict_directive() {
                     flags |= ScopeFlags::StrictMode;
                 }
@@ -2467,7 +2465,7 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
         self.enter_node(kind);
         self.visit_span(&method.span);
         self.visit_decorators(&method.decorators);
-        if method.computed && (method.r#type.is_abstract() || self.is_declare_class_element()) {
+        if method.computed && (method.r#type.is_abstract() || self.in_ambient_scope()) {
             // declare class A { [prop](): string }
             //                    ^^^^  The property can reference value or [`SymbolFlags::TypeImport`] symbol
             self.current_reference_flags = ReferenceFlags::ValueAsType;
@@ -2489,9 +2487,7 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
         self.enter_node(kind);
         self.visit_span(&prop.span);
         self.visit_decorators(&prop.decorators);
-        if prop.computed
-            && (prop.declare || prop.r#type.is_abstract() || self.is_declare_class_element())
-        {
+        if prop.computed && (prop.declare || prop.r#type.is_abstract() || self.in_ambient_scope()) {
             // class A { declare [prop]: string }
             //                   ^^^^^ The property can reference value or [`SymbolFlags::TypeImport`] symbol
             self.current_reference_flags = ReferenceFlags::ValueAsType;
@@ -2630,6 +2626,9 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
         self.enter_scope(
             {
                 let mut flags = ScopeFlags::TsModuleBlock;
+                if decl.declare {
+                    flags |= ScopeFlags::Ambient;
+                }
                 if decl.body.as_ref().is_some_and(TSModuleDeclarationBody::has_use_strict_directive)
                 {
                     flags |= ScopeFlags::StrictMode;
@@ -2651,7 +2650,10 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
         decl.bind(self);
         self.visit_span(&decl.span);
         self.visit_binding_identifier(&decl.id);
-        self.enter_scope(ScopeFlags::empty(), &decl.scope_id);
+        self.enter_scope(
+            if decl.declare { ScopeFlags::Ambient } else { ScopeFlags::empty() },
+            &decl.scope_id,
+        );
         if let Some(type_parameters) = &decl.type_parameters {
             self.visit_ts_type_parameter_declaration(type_parameters);
         }
@@ -2666,7 +2668,10 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
         decl.bind(self);
         self.visit_span(&decl.span);
         self.visit_binding_identifier(&decl.id);
-        self.enter_scope(ScopeFlags::empty(), &decl.scope_id);
+        self.enter_scope(
+            if decl.declare { ScopeFlags::Ambient } else { ScopeFlags::empty() },
+            &decl.scope_id,
+        );
         if let Some(type_parameters) = &decl.type_parameters {
             self.visit_ts_type_parameter_declaration(type_parameters);
         }
@@ -2682,7 +2687,10 @@ impl<'a> Visit<'a> for SemanticBuilder<'a> {
         decl.bind(self);
         self.visit_span(&decl.span);
         self.visit_binding_identifier(&decl.id);
-        self.visit_ts_enum_body(&decl.body);
+        self.visit_ts_enum_body(
+            &decl.body,
+            if decl.declare { ScopeFlags::Ambient } else { ScopeFlags::empty() },
+        );
         // Evaluate enum member values after all members are bound
         if self.enum_eval {
             crate::ts_enum::eval::evaluate_enum_members(decl, &mut self.scoping);

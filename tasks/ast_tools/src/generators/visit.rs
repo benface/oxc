@@ -143,6 +143,7 @@ fn parse_scope_attr(location: AttrLocation, part: AttrPart) -> Result<()> {
             enter_before_index: 0,
             exit_before_index: struct_def.fields.len(),
             flags: "ScopeFlags::empty()".to_string(),
+            ambient_if: None,
             strict_if: None,
         }))
     }
@@ -156,6 +157,11 @@ fn parse_scope_attr(location: AttrLocation, part: AttrPart) -> Result<()> {
         (AttrPart::String("flags", value), AttrLocation::Struct(struct_def)) => {
             let scope = get_or_create_scope(struct_def)?;
             scope.flags = value;
+        }
+        // `#[scope(ambient_if = ...)` on struct
+        (AttrPart::String("ambient_if", value), AttrLocation::Struct(struct_def)) => {
+            let scope = get_or_create_scope(struct_def)?;
+            scope.ambient_if = Some(value);
         }
         // `#[scope(strict_if = ...)` on struct
         (AttrPart::String("strict_if", value), AttrLocation::Struct(struct_def)) => {
@@ -386,13 +392,23 @@ impl VisitBuilder<'_> {
         // They will be inserted before the relevant fields.
         let (mut scope_entry, mut scope_exit) = if let Some(scope) = &struct_def.visit.scope {
             let mut flags = parse_str::<Expr>(&scope.flags).unwrap().to_token_stream();
-            if let Some(strict_if) = &scope.strict_if {
-                let strict_if = parse_str::<Expr>(&strict_if.cow_replace("self", "it")).unwrap();
+            if scope.ambient_if.is_some() || scope.strict_if.is_some() {
+                let ambient_if =
+                    scope.ambient_if.as_ref().map_or_else(TokenStream::new, |condition| {
+                        let condition =
+                            parse_str::<Expr>(&condition.cow_replace("self", "it")).unwrap();
+                        quote!( if #condition { flags |= ScopeFlags::Ambient; } )
+                    });
+                let strict_if =
+                    scope.strict_if.as_ref().map_or_else(TokenStream::new, |condition| {
+                        let condition =
+                            parse_str::<Expr>(&condition.cow_replace("self", "it")).unwrap();
+                        quote!( if #condition { flags |= ScopeFlags::StrictMode; } )
+                    });
                 flags = quote! {{
                     let mut flags = #flags;
-                    if #strict_if {
-                        flags |= ScopeFlags::StrictMode;
-                    }
+                    #ambient_if
+                    #strict_if
                     flags
                 }}
             }

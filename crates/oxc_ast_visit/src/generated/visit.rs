@@ -782,8 +782,8 @@ pub trait Visit<'a>: Sized {
     }
 
     #[inline]
-    fn visit_ts_enum_body(&mut self, it: &TSEnumBody<'a>) {
-        walk_ts_enum_body(self, it);
+    fn visit_ts_enum_body(&mut self, it: &TSEnumBody<'a>, flags: ScopeFlags) {
+        walk_ts_enum_body(self, it, flags);
     }
 
     #[inline]
@@ -1361,6 +1361,9 @@ pub mod walk {
         visitor.enter_scope(
             {
                 let mut flags = ScopeFlags::Top;
+                if it.source_type.is_typescript_definition() {
+                    flags |= ScopeFlags::Ambient;
+                }
                 if it.source_type.is_strict() || it.has_use_strict_directive() {
                     flags |= ScopeFlags::StrictMode;
                 }
@@ -2439,6 +2442,9 @@ pub mod walk {
         visitor.enter_scope(
             {
                 let mut flags = flags;
+                if it.declare {
+                    flags |= ScopeFlags::Ambient;
+                }
                 if it.has_use_strict_directive() {
                     flags |= ScopeFlags::StrictMode;
                 }
@@ -2570,7 +2576,16 @@ pub mod walk {
         if let Some(id) = &it.id {
             visitor.visit_binding_identifier(id);
         }
-        visitor.enter_scope(ScopeFlags::StrictMode, &it.scope_id);
+        visitor.enter_scope(
+            {
+                let mut flags = ScopeFlags::StrictMode;
+                if it.declare {
+                    flags |= ScopeFlags::Ambient;
+                }
+                flags
+            },
+            &it.scope_id,
+        );
         if let Some(type_parameters) = &it.type_parameters {
             visitor.visit_ts_type_parameter_declaration(type_parameters);
         }
@@ -3213,15 +3228,22 @@ pub mod walk {
         visitor.enter_node(kind);
         visitor.visit_span(&it.span);
         visitor.visit_binding_identifier(&it.id);
-        visitor.visit_ts_enum_body(&it.body);
+        {
+            let flags = if it.declare { ScopeFlags::Ambient } else { ScopeFlags::empty() };
+            visitor.visit_ts_enum_body(&it.body, flags);
+        }
         visitor.leave_node(kind);
     }
 
     #[inline]
-    pub fn walk_ts_enum_body<'a, V: Visit<'a>>(visitor: &mut V, it: &TSEnumBody<'a>) {
+    pub fn walk_ts_enum_body<'a, V: Visit<'a>>(
+        visitor: &mut V,
+        it: &TSEnumBody<'a>,
+        flags: ScopeFlags,
+    ) {
         let kind = AstKind::TSEnumBody(visitor.alloc(it));
         visitor.enter_node(kind);
-        visitor.enter_scope(ScopeFlags::empty(), &it.scope_id);
+        visitor.enter_scope(flags, &it.scope_id);
         visitor.visit_span(&it.span);
         visitor.visit_ts_enum_members(&it.members);
         visitor.leave_scope();
@@ -3644,7 +3666,16 @@ pub mod walk {
         visitor.enter_node(kind);
         visitor.visit_span(&it.span);
         visitor.visit_binding_identifier(&it.id);
-        visitor.enter_scope(ScopeFlags::empty(), &it.scope_id);
+        visitor.enter_scope(
+            {
+                let mut flags = ScopeFlags::empty();
+                if it.declare {
+                    flags |= ScopeFlags::Ambient;
+                }
+                flags
+            },
+            &it.scope_id,
+        );
         if let Some(type_parameters) = &it.type_parameters {
             visitor.visit_ts_type_parameter_declaration(type_parameters);
         }
@@ -3674,7 +3705,16 @@ pub mod walk {
         visitor.enter_node(kind);
         visitor.visit_span(&it.span);
         visitor.visit_binding_identifier(&it.id);
-        visitor.enter_scope(ScopeFlags::empty(), &it.scope_id);
+        visitor.enter_scope(
+            {
+                let mut flags = ScopeFlags::empty();
+                if it.declare {
+                    flags |= ScopeFlags::Ambient;
+                }
+                flags
+            },
+            &it.scope_id,
+        );
         if let Some(type_parameters) = &it.type_parameters {
             visitor.visit_ts_type_parameter_declaration(type_parameters);
         }
@@ -3860,6 +3900,9 @@ pub mod walk {
         visitor.enter_scope(
             {
                 let mut flags = ScopeFlags::TsModuleBlock;
+                if it.declare {
+                    flags |= ScopeFlags::Ambient;
+                }
                 if it.body.as_ref().is_some_and(TSModuleDeclarationBody::has_use_strict_directive) {
                     flags |= ScopeFlags::StrictMode;
                 }
@@ -3907,7 +3950,16 @@ pub mod walk {
     ) {
         let kind = AstKind::TSGlobalDeclaration(visitor.alloc(it));
         visitor.enter_node(kind);
-        visitor.enter_scope(ScopeFlags::TsModuleBlock, &it.scope_id);
+        visitor.enter_scope(
+            {
+                let mut flags = ScopeFlags::TsModuleBlock;
+                if it.declare {
+                    flags |= ScopeFlags::Ambient;
+                }
+                flags
+            },
+            &it.scope_id,
+        );
         visitor.visit_span(&it.span);
         visitor.visit_span(&it.global_span);
         visitor.visit_ts_module_block(&it.body);

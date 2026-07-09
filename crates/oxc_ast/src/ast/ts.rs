@@ -86,6 +86,7 @@ pub struct TSEnumDeclaration<'a> {
     pub node_id: Cell<NodeId>,
     pub span: Span,
     pub id: BindingIdentifier<'a>,
+    #[visit(args(flags = if self.declare { ScopeFlags::Ambient } else {ScopeFlags::empty() }))]
     pub body: TSEnumBody<'a>,
     /// `true` for const enums
     pub r#const: bool,
@@ -105,7 +106,10 @@ pub struct TSEnumDeclaration<'a> {
 ///   ^^^^^
 /// ```
 #[ast(visit)]
-#[scope]
+#[visit(args(flags = ScopeFlags))]
+#[scope(
+    flags = flags,
+)]
 #[derive(Debug)]
 #[generate_derive(CloneIn, Dummy, ReplaceWith, TakeIn)]
 #[generate_derive(ContentEq, ESTree, GetSpan, GetSpanMut, UnstableAddress)]
@@ -899,7 +903,7 @@ pub struct TSTypeParameterDeclaration<'a> {
 /// //         ^ type_parameters
 /// ```
 #[ast(visit)]
-#[scope]
+#[scope(ambient_if = self.declare)]
 #[derive(Debug)]
 #[generate_derive(CloneIn, Dummy, ReplaceWith, TakeIn)]
 #[generate_derive(ContentEq, ESTree, GetSpan, GetSpanMut, UnstableAddress)]
@@ -963,7 +967,7 @@ pub struct TSClassImplements<'a> {
 /// * [TypeScript in 5 Minutes - Interfaces](https://www.typescriptlang.org/docs/handbook/typescript-tooling-in-5-minutes.html#interfaces)
 /// * [TypeScript Handbook - Interfaces](https://www.typescriptlang.org/docs/handbook/2/objects.html#interfaces)
 #[ast(visit)]
-#[scope]
+#[scope(ambient_if = self.declare)]
 #[derive(Debug)]
 #[generate_derive(CloneIn, Dummy, ReplaceWith, TakeIn)]
 #[generate_derive(ContentEq, ESTree, GetSpan, GetSpanMut, UnstableAddress)]
@@ -1230,6 +1234,7 @@ pub enum TSTypePredicateName<'a> {
 #[ast(visit)]
 #[scope(
     flags = ScopeFlags::TsModuleBlock,
+    ambient_if = self.declare,
     strict_if = self.body.as_ref().is_some_and(TSModuleDeclarationBody::has_use_strict_directive),
 )]
 #[derive(Debug)]
@@ -1322,7 +1327,7 @@ pub enum TSModuleDeclarationBody<'a> {
 /// * [TypeScript Handbook - Global Augmentation](https://www.typescriptlang.org/docs/handbook/declaration-merging.html#global-augmentation)
 #[ast(visit)]
 // Directives are not allowed in `global {}` blocks, so no need for `strict_if` condition
-#[scope(flags = ScopeFlags::TsModuleBlock)]
+#[scope(flags = ScopeFlags::TsModuleBlock, ambient_if = self.declare)]
 #[derive(Debug)]
 #[generate_derive(CloneIn, Dummy, ReplaceWith, TakeIn)]
 #[generate_derive(ContentEq, ESTree, GetSpan, GetSpanMut, UnstableAddress)]

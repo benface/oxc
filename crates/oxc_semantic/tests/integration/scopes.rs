@@ -209,6 +209,21 @@ fn test_enums() {
 }
 
 #[test]
+fn test_ambient_context_without_scope() {
+    SemanticTester::ts(
+        "export {}; declare let f: (package: number) => interface; \
+         class C { declare field: package; }",
+    )
+    .build();
+
+    SemanticTester::ts(
+        "export {}; let f: (package: number) => interface; class C { field: package; }",
+    )
+    .expect_errors(true)
+    .build();
+}
+
+#[test]
 fn var_hoisting() {
     SemanticTester::js(
         "

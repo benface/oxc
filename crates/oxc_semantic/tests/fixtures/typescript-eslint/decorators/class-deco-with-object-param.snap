@@ -9,7 +9,7 @@ input_file: crates/oxc_semantic/tests/fixtures/typescript-eslint/decorators/clas
         "children": [
           {
             "children": [],
-            "flags": "ScopeFlags(0x0)",
+            "flags": "ScopeFlags(Ambient)",
             "id": 2,
             "node": "TSFunctionType",
             "symbols": [
@@ -23,7 +23,7 @@ input_file: crates/oxc_semantic/tests/fixtures/typescript-eslint/decorators/clas
             ]
           }
         ],
-        "flags": "ScopeFlags(Function)",
+        "flags": "ScopeFlags(Function | Ambient)",
         "id": 1,
         "node": "Function(deco)",
         "symbols": [

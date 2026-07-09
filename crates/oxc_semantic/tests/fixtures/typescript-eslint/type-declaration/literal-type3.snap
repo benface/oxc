@@ -21,7 +21,7 @@ input_file: crates/oxc_semantic/tests/fixtures/typescript-eslint/type-declaratio
       },
       {
         "children": [],
-        "flags": "ScopeFlags(Function)",
+        "flags": "ScopeFlags(Function | Ambient)",
         "id": 3,
         "node": "Function(setAlignment)",
         "symbols": [

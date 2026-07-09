@@ -36,7 +36,7 @@ bitflags! {
         const Function         = 1 << 2;
         const Arrow            = 1 << 3;
         const ClassStaticBlock = 1 << 4;
-        const TsModuleBlock    = 1 << 5; // `declare namespace`
+        const TsModuleBlock    = 1 << 5; // `namespace`
         const Constructor      = 1 << 6;
         const GetAccessor      = 1 << 7;
         const SetAccessor      = 1 << 8;
@@ -44,6 +44,7 @@ bitflags! {
         const DirectEval       = 1 << 10; // <https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/eval#direct_and_indirect_eval>
         const TsConditional    = 1 << 11;
         const With             = 1 << 12; // `with (obj)`
+        const Ambient          = 1 << 13; // Declaration file or inside a `declare` declaration
         const Var = Self::Top.bits() | Self::Function.bits() | Self::ClassStaticBlock.bits() | Self::TsModuleBlock.bits();
     }
 }
@@ -62,7 +63,7 @@ impl ScopeFlags {
 
     #[inline]
     pub fn is_block(self) -> bool {
-        self.is_empty() || self == Self::StrictMode
+        self.difference(Self::StrictMode | Self::Ambient).is_empty()
     }
 
     #[inline]
@@ -93,6 +94,11 @@ impl ScopeFlags {
     #[inline]
     pub fn is_ts_module_block(self) -> bool {
         self.contains(Self::TsModuleBlock)
+    }
+
+    #[inline]
+    pub fn is_ambient(self) -> bool {
+        self.contains(Self::Ambient)
     }
 
     #[inline]

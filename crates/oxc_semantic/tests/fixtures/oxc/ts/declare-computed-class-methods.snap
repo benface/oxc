@@ -9,27 +9,27 @@ input_file: crates/oxc_semantic/tests/fixtures/oxc/ts/declare-computed-class-met
         "children": [
           {
             "children": [],
-            "flags": "ScopeFlags(StrictMode | Function)",
+            "flags": "ScopeFlags(StrictMode | Function | Ambient)",
             "id": 2,
             "node": "Function(<anonymous>)",
             "symbols": []
           },
           {
             "children": [],
-            "flags": "ScopeFlags(StrictMode | Function | GetAccessor)",
+            "flags": "ScopeFlags(StrictMode | Function | GetAccessor | Ambient)",
             "id": 3,
             "node": "Function(<anonymous>)",
             "symbols": []
           },
           {
             "children": [],
-            "flags": "ScopeFlags(StrictMode | Function)",
+            "flags": "ScopeFlags(StrictMode | Function | Ambient)",
             "id": 4,
             "node": "Function(<anonymous>)",
             "symbols": []
           }
         ],
-        "flags": "ScopeFlags(StrictMode)",
+        "flags": "ScopeFlags(StrictMode | Ambient)",
         "id": 1,
         "node": "Class(AmbientFoo)",
         "symbols": []

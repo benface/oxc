@@ -14,7 +14,7 @@ input_file: crates/oxc_semantic/tests/fixtures/oxc/ts/declare-computed-class-fie
       },
       {
         "children": [],
-        "flags": "ScopeFlags(StrictMode)",
+        "flags": "ScopeFlags(StrictMode | Ambient)",
         "id": 2,
         "node": "Class(AmbientFoo)",
         "symbols": []

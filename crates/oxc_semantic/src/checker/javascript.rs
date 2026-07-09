@@ -192,7 +192,7 @@ pub fn check_identifier(
 }
 
 fn is_in_ambient_context(symbol_id: Option<SymbolId>, ctx: &SemanticBuilder<'_>) -> bool {
-    if ctx.current_scope_flags().is_ts_module_block() {
+    if ctx.current_scope_flags().is_ambient() {
         return true;
     }
 

@@ -1465,11 +1465,14 @@ impl<'a> Visit<'a> for ChildScopeCollector {
 
     #[inline]
     fn visit_ts_enum_declaration(&mut self, it: &TSEnumDeclaration<'a>) {
-        self.visit_ts_enum_body(&it.body);
+        {
+            let flags = if it.declare { ScopeFlags::Ambient } else { ScopeFlags::empty() };
+            self.visit_ts_enum_body(&it.body, flags);
+        }
     }
 
     #[inline]
-    fn visit_ts_enum_body(&mut self, it: &TSEnumBody<'a>) {
+    fn visit_ts_enum_body(&mut self, it: &TSEnumBody<'a>, _: ScopeFlags) {
         self.add_scope(&it.scope_id);
     }
 

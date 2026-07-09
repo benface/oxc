@@ -121,6 +121,9 @@ pub struct Scope {
     /// Scope flags for the scope.
     /// Stored as a string which should be parsed as an expression.
     pub flags: String,
+    /// Conditions in which scope is ambient.
+    /// Stored as a string which should be parsed as an expression.
+    pub ambient_if: Option<String>,
     /// Conditions in which scope is strict mode.
     /// Stored as a string which should be parsed as an expression.
     pub strict_if: Option<String>,
