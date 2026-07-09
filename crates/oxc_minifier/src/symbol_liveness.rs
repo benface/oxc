@@ -117,12 +117,17 @@ const CANDIDATE_KINDS: SymbolFlags = SymbolFlags::FunctionScopedVariable
 
 /// Whether the driver must recompute [`compute_dead_symbols`] after a flush:
 /// a reference to a candidate-kind symbol was pruned while the symbol still
-/// has remaining references — the only transition that can turn a live
-/// reference cycle dead. A dropped direct eval also triggers (the flag
+/// has remaining references — the reference-loss transition that turns a
+/// live reference cycle dead. A dropped direct eval also triggers (the flag
 /// refresh may clear the root flag that forces [`compute_dead_symbols`] to
-/// skip). On large inputs most passes prune such references, so this fires
-/// often; its job is to skip the walk for quiet/late iterations, not to make
-/// recomputes rare.
+/// skip). Candidacy-SHAPE transitions are deliberately NOT caught: a fold
+/// can turn a specialized-kind init into a fully-removable one (e.g.
+/// `(0, () => b())` into `() => b()`) without pruning any reference, so the
+/// newly-dead cycle survives this run — stale toward LIVE, hence sound; the
+/// cycle drops on a second minify run (a known non-idempotency, traded for
+/// not re-walking on every shape-changing fold). On large inputs most
+/// passes prune candidate-kind references, so this fires often; its job is
+/// to skip the walk for quiet/late iterations, not to make recomputes rare.
 ///
 /// Must be called AFTER `retain_resolved_references_excluding`: the prune
 /// only shrinks per-symbol resolved-reference lists, `Reference` entries
@@ -497,4 +502,42 @@ impl<'a> Visit<'a> for Collector<'_, '_> {
         }
         self.walk_declaration(candidate, |v| walk_variable_declarator(v, it));
     }
+}
+
+/// Debug backstop for the residue path in `handle_variable_declaration`:
+/// when a DEAD-marked declarator's initializer survives as an expression
+/// statement, none of its references may resolve to a dead-marked symbol.
+/// Residue from a dead-cycle member can only contain references that were
+/// attributed outward as roots (hence live) — candidacy excludes
+/// residue-leaving init kinds precisely so their references are never
+/// deferred. This is the declarator-side twin of the extracts-nothing
+/// `debug_assert` at the class removal site, guarding the one direction a
+/// future pass could silently break: moving an expression that carries a
+/// dead-region reference into a candidate's init. Sound residue exists
+/// (single-use inlining rewrites a dead declarator's init to a live call),
+/// so only dead-REFERENCING residue is a violation.
+#[cfg(debug_assertions)]
+pub fn debug_assert_no_dead_references(
+    expr: &Expression<'_>,
+    scoping: &Scoping,
+    dead_symbols: &BitSet<'_>,
+) {
+    struct Checker<'b, 'c> {
+        scoping: &'b Scoping,
+        dead_symbols: &'b BitSet<'c>,
+    }
+    impl<'a> Visit<'a> for Checker<'_, '_> {
+        fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
+            if let Some(reference_id) = it.reference_id.get()
+                && let Some(symbol_id) = self.scoping.get_reference(reference_id).symbol_id()
+            {
+                debug_assert!(
+                    !self.dead_symbols.contains(symbol_id.index()),
+                    "residue of a dead-marked declarator references dead-marked symbol `{}`",
+                    self.scoping.symbol_name(symbol_id)
+                );
+            }
+        }
+    }
+    Checker { scoping, dead_symbols }.visit_expression(expr);
 }

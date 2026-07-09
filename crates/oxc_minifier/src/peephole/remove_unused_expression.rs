@@ -20,24 +20,34 @@ use super::fold_constants::is_cjs_module_exports_hint;
 impl<'a> PeepholeOptimizations {
     /// `SimplifyUnusedExpr`: <https://github.com/evanw/esbuild/blob/v0.24.2/internal/js_ast/js_ast_helpers.go#L534>
     pub fn remove_unused_expression(e: &mut Expression<'a>, ctx: &mut TraverseCtx<'a>) -> bool {
-        match e {
-            Expression::ArrayExpression(_) => Self::remove_unused_array_expr(e, ctx),
-            Expression::AssignmentExpression(_) => Self::remove_unused_assignment_expr(e, ctx),
-            Expression::BinaryExpression(_) => Self::remove_unused_binary_expr(e, ctx),
-            Expression::CallExpression(_) => Self::remove_unused_call_expr(e, ctx),
-            Expression::ClassExpression(_) => Self::remove_unused_class_expr(e, ctx),
-            Expression::ConditionalExpression(_) => Self::remove_unused_conditional_expr(e, ctx),
-            Expression::LogicalExpression(_) => Self::remove_unused_logical_expr(e, ctx),
-            Expression::NewExpression(_) => Self::remove_unused_new_expr(e, ctx),
-            Expression::ObjectExpression(_) => Self::remove_unused_object_expr(e, ctx),
-            Expression::SequenceExpression(_) => Self::remove_unused_sequence_expr(e, ctx),
-            Expression::TemplateLiteral(_) => Self::remove_unused_template_literal(e, ctx),
-            Expression::UnaryExpression(_) => Self::remove_unused_unary_expr(e, ctx),
-            // In a derived class constructor, accessing `this` before `super()` throws
-            // a `ReferenceError`, so we must keep it. In all other positions (including
-            // non-derived constructors) `this` is always initialized and can be dropped.
-            Expression::ThisExpression(_) => !Self::this_is_inside_derived_constructor(ctx),
-            _ => !e.may_have_side_effects(ctx),
+        // Routed through `expr_has_specialized_unused_handler` so the
+        // predicate cannot drift from the dispatch (see its doc).
+        if Self::expr_has_specialized_unused_handler(e) {
+            match e {
+                Expression::ArrayExpression(_) => Self::remove_unused_array_expr(e, ctx),
+                Expression::AssignmentExpression(_) => Self::remove_unused_assignment_expr(e, ctx),
+                Expression::BinaryExpression(_) => Self::remove_unused_binary_expr(e, ctx),
+                Expression::CallExpression(_) => Self::remove_unused_call_expr(e, ctx),
+                Expression::ClassExpression(_) => Self::remove_unused_class_expr(e, ctx),
+                Expression::ConditionalExpression(_) => {
+                    Self::remove_unused_conditional_expr(e, ctx)
+                }
+                Expression::LogicalExpression(_) => Self::remove_unused_logical_expr(e, ctx),
+                Expression::NewExpression(_) => Self::remove_unused_new_expr(e, ctx),
+                Expression::ObjectExpression(_) => Self::remove_unused_object_expr(e, ctx),
+                Expression::SequenceExpression(_) => Self::remove_unused_sequence_expr(e, ctx),
+                Expression::TemplateLiteral(_) => Self::remove_unused_template_literal(e, ctx),
+                Expression::UnaryExpression(_) => Self::remove_unused_unary_expr(e, ctx),
+                // In a derived class constructor, accessing `this` before `super()` throws
+                // a `ReferenceError`, so we must keep it. In all other positions (including
+                // non-derived constructors) `this` is always initialized and can be dropped.
+                Expression::ThisExpression(_) => !Self::this_is_inside_derived_constructor(ctx),
+                _ => unreachable!(
+                    "expr_has_specialized_unused_handler is out of sync with this dispatch"
+                ),
+            }
+        } else {
+            !e.may_have_side_effects(ctx)
         }
     }
 
@@ -1064,11 +1074,23 @@ impl<'a> PeepholeOptimizations {
         if !c.decorators.is_empty() {
             return ClassRemovability::Keep;
         }
-        // TypeError `class C extends (() => {}) {}`
-        if c.super_class
-            .as_ref()
-            .is_some_and(|e| matches!(e, Expression::ArrowFunctionExpression(_)))
-        {
+        // TypeError `class C extends (() => {}) {}`. Unwrap parens and
+        // sequence tails — `(0, () => {})` — so the classification cannot
+        // flip to `Keep` when a later fold surfaces the literal arrow (a
+        // dead-cycle class classified `RemovesClean` at liveness-compute
+        // time must not become unremovable at its removal site). Other fold
+        // families could still surface an arrow mid-pass; such flips stay
+        // sound because a fold only surfaces an arrow the original heritage
+        // already evaluated to, so both versions throw the same TypeError
+        // before any reference to a removed cycle member can execute.
+        if c.super_class.as_ref().is_some_and(|e| {
+            let mut e = e.get_inner_expression();
+            while let Expression::SequenceExpression(seq) = e {
+                let Some(last) = seq.expressions.last() else { break };
+                e = last.get_inner_expression();
+            }
+            matches!(e, Expression::ArrowFunctionExpression(_))
+        }) {
             return ClassRemovability::Keep;
         }
         let mut extracts = false;
@@ -1119,11 +1141,15 @@ impl<'a> PeepholeOptimizations {
 
     /// Expression kinds the `remove_unused_expression` dispatch above sends
     /// to a specialized handler, which may REDUCE the expression (leaving
-    /// residue) instead of dropping it whole. Keep this list in sync with
-    /// the dispatch arms — the symbol-liveness analysis relies on every
-    /// other pure expression being dropped without residue by the `_`
-    /// fallthrough (`ThisExpression` counts as specialized: its removal
-    /// depends on traversal position).
+    /// residue) instead of dropping it whole. The symbol-liveness analysis
+    /// relies on every other pure expression being dropped without residue
+    /// by the generic branch (`ThisExpression` counts as specialized: its
+    /// removal depends on traversal position).
+    ///
+    /// The dispatch routes through this predicate, so the two cannot drift
+    /// silently: a new specialized arm without a predicate entry is dead
+    /// code (its author's own tests fail), and a predicate entry without a
+    /// dispatch arm hits the `unreachable!`.
     pub(crate) fn expr_has_specialized_unused_handler(e: &Expression<'a>) -> bool {
         matches!(
             e,

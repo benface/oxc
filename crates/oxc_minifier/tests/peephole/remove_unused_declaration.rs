@@ -459,6 +459,22 @@ fn keep_recursive_cycle_with_side_effectful_evaluation() {
 }
 
 #[test]
+fn keep_class_cycle_with_wrapped_arrow_heritage() {
+    // `classify_class_removability` must see the arrow heritage through a
+    // pure sequence/paren wrapper: liveness classifies the pre-fold shape,
+    // but a fold surfaces the literal arrow before the removal site
+    // re-classifies, and the Keep flip would strand `A` referencing a
+    // removed `B`.
+    test_smallest(
+        "class A extends (0, () => {}) { m() { new B() } } class B { m() { new A() } } console.log(1);",
+        "class A extends (() => {}) {\n\tm() {\n\t\tnew B();\n\t}\n}\nclass B {\n\tm() {\n\t\tnew A();\n\t}\n}\nconsole.log(1);",
+    );
+    // The single, fully-unused class is kept for the same reason a literal
+    // arrow heritage is kept: evaluating it is a guaranteed TypeError.
+    test_smallest("class C extends (0, () => {}) {}", "class C extends (() => {}) {}");
+}
+
+#[test]
 fn keep_recursive_function_in_script_mode_top_level() {
     let options = CompressOptions::smallest();
     let source_type = SourceType::cjs().with_script(true);
